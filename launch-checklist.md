@@ -1,0 +1,21 @@
+# Launch checklist
+
+- [ ] Business/legal entity and operating model confirmed
+- [ ] Domain registered
+- [ ] Production hosting account
+- [ ] PostgreSQL production database
+- [ ] HTTPS
+- [ ] Safaricom Daraja account and approved production credentials
+- [ ] Payment reconciliation tested
+- [ ] Android release signing
+- [ ] Google Play developer account
+- [ ] Privacy policy published
+- [ ] Terms published
+- [ ] Data safety form completed
+- [ ] Closed testing completed where required
+- [ ] Crash monitoring
+- [ ] Admin MFA
+- [ ] Backup/restore test
+- [ ] Security review
+- [ ] First advertising campaign
+- [ ] Customer support channel
