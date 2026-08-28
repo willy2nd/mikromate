@@ -606,8 +606,8 @@ async function startServer() {
     await initDatabase();
 
     await pool.query("SELECT 1");
-
-    app.listen(port, () => {
+app.listen(port,"0.0.0.0", () => {
+    
       console.log(
         `MikroMate API listening on ${port}`
       );
