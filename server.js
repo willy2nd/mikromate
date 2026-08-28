@@ -9,10 +9,14 @@ import pg from "pg";
 const { Pool } = pg;
 
 const app = express();
-const port = process.env.PORT || 8080;
+const port = Number(process.env.PORT) || 10000;
 const feePct = Number(process.env.PLATFORM_FEE_PERCENT || 10);
-const jwtSecret = process.env.JWT_SECRET || "DEV_ONLY_CHANGE_ME";
+const jwtSecret = process.env.JWT_SECRET;
 
+if (!jwtSecret) {
+  console.error("JWT_SECRET is not configured");
+  process.exit(1);
+}
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL is not configured");
   process.exit(1);
