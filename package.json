@@ -3,7 +3,7 @@
   "version":"5.0.0",
   "private":true,
   "type":"module",
-  "scripts":{"start":"node src/server.js","dev":"node --watch src/server.js","test":"node --test ../tests/api.test.js"},
+  "scripts":{"start":"node server.js","dev":"node --watch src/server.js","test":"node --test ../tests/api.test.js"},
   "dependencies":{
     "cors":"^2.8.5",
     "express":"^5.1.0",
