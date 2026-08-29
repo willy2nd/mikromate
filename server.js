@@ -606,23 +606,18 @@ app.post("/api/payments/mpesa/callback", (req, res) => {
 });
 
 async function startServer() {
+  // Start HTTP server immediately so Render can detect the port.
+  app.listen(port, "0.0.0.0", () => {
+    console.log(`MikroMate API listening on ${port}`);
+  });
+
   try {
     await initDatabase();
-
     await pool.query("SELECT 1");
-app.listen(port,"0.0.0.0", () => {
-    
-      console.log(
-        `MikroMate API listening on ${port}`
-      );
-    });
-  } catch (e) {
-    console.error(
-      "Unable to start MikroMate:",
-      e
-    );
 
-    process.exit(1);
+    console.log("MikroMate PostgreSQL database connected");
+  } catch (e) {
+    console.error("PostgreSQL connection failed:", e);
   }
 }
 
