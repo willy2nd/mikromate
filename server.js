@@ -5,9 +5,12 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
-
+import path from "path";
+import { fileURLToPath } from "url";
 const { Pool } = pg;
-
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const rootDir = path.join(__dirname, "..");
 const app = express();
 const port = Number(process.env.PORT) || 10000;
 const feePct = Number(process.env.PLATFORM_FEE_PERCENT || 10);
@@ -605,16 +608,12 @@ app.post("/api/payments/mpesa/callback", (req, res) => {
     error: "M-Pesa callback not implemented yet"
   });
 });
-
+app.get("/", (req, res) => {
+  res.sendFile(path.join(rootDir, "index.html"));
+});
 async function startServer() {
   // Start HTTP server immediately so Render can detect the port.
- app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    message: "MikroMate API is live",
-    database: "PostgreSQL connected"
-  });
-});
+ 
   app.listen(port, "0.0.0.0", () => {
     console.log(`MikroMate API listening on ${port}`);
   });
