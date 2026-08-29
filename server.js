@@ -607,6 +607,13 @@ app.post("/api/payments/mpesa/callback", (req, res) => {
 
 async function startServer() {
   // Start HTTP server immediately so Render can detect the port.
+ app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "MikroMate API is live",
+    database: "PostgreSQL connected"
+  });
+});
   app.listen(port, "0.0.0.0", () => {
     console.log(`MikroMate API listening on ${port}`);
   });
