@@ -114,9 +114,10 @@ function auth(req, res, next) {
   try {
     req.user = jwt.verify(h.slice(7), jwtSecret);
     next();
-  } catch {
-    return res.status(401).json({ error: "Invalid session" });
-  }
+} catch (e) {
+  console.error("JWT verification failed:", e.name, e.message);
+  return res.status(401).json({ error: "Invalid session" });
+}
 }
 
 function admin(req, res, next) {
