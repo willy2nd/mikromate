@@ -590,7 +590,46 @@ app.get("/api/admin/disputes", auth, admin, async (req, res) => {
     });
   }
 });
+app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
+  try {
+    const revenueResult = await pool.query(`
+      SELECT
+        COALESCE(SUM(gross_amount),0) AS gross,
+        COALESCE(SUM(platform_fee),0) AS fees,
+        COUNT(*) AS transactions
+      FROM transactions
+    `);
 
+    const usersResult = await pool.query(`
+      SELECT COUNT(*) AS users
+      FROM users
+    `);
+
+    const disputesResult = await pool.query(`
+      SELECT COUNT(*) AS disputes
+      FROM disputes
+      WHERE status='OPEN'
+    `);
+
+    const revenue = revenueResult.rows[0];
+
+    res.json({
+      revenue: revenue.fees,
+      gross: revenue.gross,
+      fees: revenue.fees,
+      transactions: Number(revenue.transactions),
+      users: Number(usersResult.rows[0].users),
+      disputes: Number(disputesResult.rows[0].disputes)
+    });
+
+  } catch (e) {
+    console.error("Admin dashboard error:", e);
+
+    res.status(500).json({
+      error: "Unable to load admin dashboard"
+    });
+  }
+});
 /*
  * M-Pesa integration remains intentionally disabled for this step.
  * We will implement Daraja STK Push after PostgreSQL is verified.
