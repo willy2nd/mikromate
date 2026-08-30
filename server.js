@@ -590,42 +590,6 @@ app.get("/api/admin/disputes", auth, admin, async (req, res) => {
     });
   }
 });
-// TEMPORARY: check whether the intended administrator account exists.
-// Remove this endpoint immediately after verification.
-app.get("/api/setup/check-admin", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, name, email, role, verified, created_at
-       FROM users
-       WHERE LOWER(email) = LOWER($1)`,
-      ["undawilliam2@gmail.com"]
-    );
-
-    if (result.rows.length === 0) {
-      return res.json({
-        exists: false
-      });
-    }
-
-    const user = result.rows[0];
-
-    res.json({
-      exists: true,
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      verified: !!user.verified,
-      created_at: user.created_at
-    });
-  } catch (e) {
-    console.error("Admin account check error:", e);
-
-    res.status(500).json({
-      error: "Unable to check account"
-    });
-  }
-});
 app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
   try {
     const revenueResult = await pool.query(`
