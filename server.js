@@ -10,7 +10,7 @@ import { fileURLToPath } from "url";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const rootDir = path.join(__dirname, "..");
+const rootDir = __dirname;
 const app = express();
 const port = Number(process.env.PORT) || 10000;
 const feePct = Number(process.env.PLATFORM_FEE_PERCENT || 10);
