@@ -130,7 +130,62 @@ function admin(req, res, next) {
 
   next();
 }
+app.post("/api/admin/setup", async (req, res) => {
+  const setupSecret = process.env.ADMIN_SETUP_SECRET;
 
+  if (!setupSecret) {
+    return res.status(503).json({
+      error: "Admin setup is not configured"
+    });
+  }
+
+  if (req.get("x-admin-setup-secret") !== setupSecret) {
+    return res.status(403).json({
+      error: "Invalid setup secret"
+    });
+  }
+
+  const { name, email, password } = req.body;
+
+  if (!name || !email || !password || password.length < 12) {
+    return res.status(400).json({
+      error: "Name, email and 12+ character password required"
+    });
+  }
+
+  try {
+    
+const existingAdmin = await pool.query(
+  "SELECT id FROM users WHERE role='ADMIN' LIMIT 1"
+);
+
+if (existingAdmin.rows.length > 0) {
+  return res.status(409).json({
+    error: "Administrator setup has already been completed"
+  });
+}
+    const hash = await bcrypt.hash(password, 12);
+
+    const result = await pool.query(
+      `INSERT INTO users
+       (name,email,password_hash,role,verified)
+       VALUES($1,$2,$3,'ADMIN',1)
+       RETURNING id,name,email,role,verified`,
+      [name, email, hash]
+    );
+
+    res.status(201).json({
+      message: "Administrator created successfully",
+      user: result.rows[0]
+    });
+  } catch (e) {
+    console.error("Admin setup error:", e);
+
+    res.status(500).json({
+      error: "Unable to create administrator"
+    });
+  }
+});
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
