@@ -7,6 +7,7 @@ import jwt from "jsonwebtoken";
 import pg from "pg";
 import path from "path";
 import { fileURLToPath } from "url";
+import { stkPush } from "./mpesa.js";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -686,21 +687,125 @@ app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
   }
 });
 /*
- * M-Pesa integration remains intentionally disabled for this step.
- * We will implement Daraja STK Push after PostgreSQL is verified.
+/*
+ * M-Pesa Daraja STK Push
  */
 
-app.post("/api/payments/mpesa/initiate", auth, (req, res) => {
-  res.status(501).json({
-    error: "M-Pesa integration not implemented yet",
-    next: "PostgreSQL must be verified before enabling Daraja payments."
-  });
+app.post("/api/payments/mpesa/initiate", auth, async (req, res) => {
+  try {
+    const { phone, amount, taskId } = req.body;
+
+    const paymentAmount = Number(amount);
+
+    if (!phone || !Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+      return res.status(400).json({
+        error: "Phone and valid amount are required"
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO transactions
+       (task_id,payer_id,gross_amount,platform_fee,provider_amount,status)
+       VALUES($1,$2,$3,$4,$5,'PAYMENT_PENDING')
+       RETURNING id`,
+      [
+        taskId || 0,
+        req.user.id,
+        Math.round(paymentAmount),
+        Math.round(paymentAmount * feePct / 100),
+        Math.round(
+          paymentAmount - (paymentAmount * feePct / 100)
+        )
+      ]
+    );
+
+    const transactionId = result.rows[0].id;
+
+    const stk = await stkPush({
+      phone,
+      amount: paymentAmount,
+      accountReference: `MM${transactionId}`,
+      transactionDesc: "MikroMate payment"
+    });
+
+    await pool.query(
+      `UPDATE transactions
+       SET external_reference=$1
+       WHERE id=$2`,
+      [
+        stk.CheckoutRequestID ||
+        stk.MerchantRequestID ||
+        null,
+        transactionId
+      ]
+    );
+
+    res.json({
+      ok: true,
+      transaction_id: transactionId,
+      merchant_request_id: stk.MerchantRequestID || null,
+      checkout_request_id: stk.CheckoutRequestID || null,
+      response_code: stk.ResponseCode || null,
+      customer_message: stk.CustomerMessage || null
+    });
+
+  } catch (e) {
+    console.error("M-Pesa STK initiation error:", e);
+
+    res.status(500).json({
+      error: "Unable to initiate M-Pesa payment",
+      message: e.message
+    });
+  }
 });
 
-app.post("/api/payments/mpesa/callback", (req, res) => {
-  res.status(501).json({
-    error: "M-Pesa callback not implemented yet"
-  });
+
+app.post("/api/payments/mpesa/callback", async (req, res) => {
+  try {
+    console.log(
+      "M-Pesa callback received:",
+      JSON.stringify(req.body)
+    );
+
+    const callback = req.body?.Body?.stkCallback;
+
+    if (!callback) {
+      return res.json({
+        ResultCode: 0,
+        ResultDesc: "Accepted"
+      });
+    }
+
+    const checkoutRequestId = callback.CheckoutRequestID;
+    const resultCode = Number(callback.ResultCode);
+
+    if (checkoutRequestId) {
+      const status =
+        resultCode === 0
+          ? "PAID"
+          : "PAYMENT_FAILED";
+
+      await pool.query(
+        `UPDATE transactions
+         SET status=$1
+         WHERE external_reference=$2`,
+        [status, checkoutRequestId]
+      );
+    }
+
+    res.json({
+      ResultCode: 0,
+      ResultDesc: "Accepted"
+    });
+
+  } catch (e) {
+    console.error("M-Pesa callback error:", e);
+
+    res.json({
+      ResultCode: 0,
+      ResultDesc: "Accepted"
+    });
+  }
 });
 app.get("/", (req, res) => {
   res.sendFile(path.join(rootDir, "index.html"));
