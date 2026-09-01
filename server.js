@@ -7,7 +7,7 @@ import jwt from "jsonwebtoken";
 import pg from "pg";
 import path from "path";
 import { fileURLToPath } from "url";
-import { stkPush } from "./mpesa.js";
+import { getAccessToken, stkPush } from "./mpesa.js";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
