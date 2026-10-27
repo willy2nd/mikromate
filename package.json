@@ -2,6 +2,9 @@
   "name":"mikromate-api",
   "version":"5.0.0",
   "private":true,
+  "engines": {
+  "node": "24.22.1"
+},
   "type":"module",
   "scripts":{"start":"node server.js","dev":"node --watch src/server.js","test":"node --test ../tests/api.test.js"},
   "dependencies":{
