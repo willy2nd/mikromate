@@ -1,0 +1,40 @@
+
+name: MikroMate npm security audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'package.json'
+      - '.github/workflows/npm-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+
+      - name: Create temporary dependency lock
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Run report-only security audit
+        run: |
+          npm audit --json > npm-audit-report.json || true
+          node -e "const r=require('./npm-audit-report.json'); console.log(JSON.stringify(r.metadata?.vulnerabilities ?? r.error ?? r, null, 2)); for (const [n,v] of Object.entries(r.vulnerabilities ?? {})) console.log(n, '| severity:', v.severity, '| affected:', v.range, '| fix:', JSON.stringify(v.fixAvailable), '| details:', JSON.stringify(v.via))"
+
+      - name: Save full audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mikromate-npm-audit-report
+          path: npm-audit-report.json
+          if-no-files-found: ignore
