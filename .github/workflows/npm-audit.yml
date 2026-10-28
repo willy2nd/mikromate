@@ -23,13 +23,16 @@ jobs:
         with:
           node-version: '24.22.1'
 
-      - name: Create temporary dependency lock
-        run: npm install --package-lock-only --ignore-scripts
+      - name: Install dependencies and create lockfile
+        run: npm install --ignore-scripts
 
-      - name: Run report-only security audit
+      - name: Show installed package versions
+        run: npm ls --depth=0 || true
+
+      - name: Report security vulnerabilities
         run: |
           npm audit --json > npm-audit-report.json || true
-          node -e "const r=require('./npm-audit-report.json'); console.log(JSON.stringify(r.metadata?.vulnerabilities ?? r.error ?? r, null, 2)); for (const [n,v] of Object.entries(r.vulnerabilities ?? {})) console.log(n, '| severity:', v.severity, '| affected:', v.range, '| fix:', JSON.stringify(v.fixAvailable), '| details:', JSON.stringify(v.via))"
+          node -e "const r=require('./npm-audit-report.json'); console.log('SUMMARY:',JSON.stringify(r.metadata?.vulnerabilities ?? r.error)); for (const [n,v] of Object.entries(r.vulnerabilities ?? {})) console.log('\nPACKAGE:',n,'\nSEVERITY:',v.severity,'\nAFFECTED:',v.range,'\nFIX:',JSON.stringify(v.fixAvailable),'\nDETAILS:',JSON.stringify(v.via))"
 
       - name: Save full audit report
         if: always()
