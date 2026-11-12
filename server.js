@@ -417,6 +417,40 @@ app.post("/api/tasks/:id/applications", auth, async (req, res) => {
 });
 
 
+app.get("/api/my-applications", auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         a.id AS application_id,
+         a.task_id,
+         a.message,
+         a.status AS application_status,
+         a.created_at AS applied_at,
+         t.title,
+         t.description,
+         t.category,
+         t.reward,
+         t.status AS job_status,
+         u.name AS employer_name
+       FROM task_applications a
+       JOIN tasks t ON t.id = a.task_id
+       JOIN users u ON u.id = t.owner_id
+       WHERE a.applicant_id = $1
+       ORDER BY a.created_at DESC`,
+      [req.user.id]
+    );
+
+    res.json(result.rows);
+
+  } catch (e) {
+    console.error("My applications error:", e);
+
+    res.status(500).json({
+      error: "Unable to load your applications"
+    });
+  }
+});
+
 app.post("/api/tasks", auth, async (req, res) => {
   const {
     title,
