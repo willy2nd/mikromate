@@ -133,6 +133,17 @@ ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES';
 ALTER TABLE tasks
 ALTER COLUMN reward TYPE NUMERIC(14,2)
 USING reward::NUMERIC(14,2);
+-- Update task reward constraint for international currencies
+ALTER TABLE tasks
+DROP CONSTRAINT IF EXISTS tasks_reward_check;
+
+ALTER TABLE tasks
+ADD CONSTRAINT tasks_reward_check
+CHECK (
+  (currency = 'KES' AND reward >= 50)
+  OR
+  (currency <> 'KES' AND reward >= 1)
+);
 
 ALTER TABLE transactions
 ALTER COLUMN gross_amount TYPE NUMERIC(14,2)
