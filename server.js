@@ -345,6 +345,78 @@ app.get("/api/tasks", async (req, res) => {
   }
 });
 
+app.post("/api/tasks/:id/applications", auth, async (req, res) => {
+  const taskId = Number(req.params.id);
+  const message = String(req.body.message || "").trim();
+
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    return res.status(400).json({
+      error: "Invalid job ID"
+    });
+  }
+
+  if (message.length > 1000) {
+    return res.status(400).json({
+      error: "Application message is too long"
+    });
+  }
+
+  try {
+    const taskResult = await pool.query(
+      "SELECT id, owner_id, status FROM tasks WHERE id=$1",
+      [taskId]
+    );
+
+    const task = taskResult.rows[0];
+
+    if (!task) {
+      return res.status(404).json({
+        error: "Job not found"
+      });
+    }
+
+    if (task.status !== "OPEN") {
+      return res.status(409).json({
+        error: "This job is no longer available"
+      });
+    }
+
+    if (Number(task.owner_id) === Number(req.user.id)) {
+      return res.status(403).json({
+        error: "You cannot apply for your own job"
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO task_applications
+       (task_id, applicant_id, message)
+       VALUES($1, $2, $3)
+       ON CONFLICT(task_id, applicant_id) DO NOTHING
+       RETURNING id, task_id, applicant_id, message, status, created_at`,
+      [taskId, req.user.id, message || null]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(409).json({
+        error: "You have already applied for this job"
+      });
+    }
+
+    res.status(201).json({
+      message: "Job application submitted successfully",
+      application: result.rows[0]
+    });
+
+  } catch (e) {
+    console.error("Job application error:", e);
+
+    res.status(500).json({
+      error: "Unable to submit job application"
+    });
+  }
+});
+
+
 app.post("/api/tasks", auth, async (req, res) => {
   const {
     title,
