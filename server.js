@@ -115,6 +115,36 @@ async function initDatabase() {
       reward INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'PENDING'
     );
+    -- International country support
+ALTER TABLE users
+ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) NOT NULL DEFAULT 'KE';
+
+ALTER TABLE tasks
+ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) NOT NULL DEFAULT 'KE';
+
+-- Multi-currency support
+ALTER TABLE tasks
+ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES';
+
+ALTER TABLE transactions
+ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES';
+
+-- Prepare monetary fields for decimal amounts
+ALTER TABLE tasks
+ALTER COLUMN reward TYPE NUMERIC(14,2)
+USING reward::NUMERIC(14,2);
+
+ALTER TABLE transactions
+ALTER COLUMN gross_amount TYPE NUMERIC(14,2)
+USING gross_amount::NUMERIC(14,2);
+
+ALTER TABLE transactions
+ALTER COLUMN platform_fee TYPE NUMERIC(14,2)
+USING platform_fee::NUMERIC(14,2);
+
+ALTER TABLE transactions
+ALTER COLUMN provider_amount TYPE NUMERIC(14,2)
+USING provider_amount::NUMERIC(14,2);
   `);
 
   console.log("PostgreSQL database initialized");
