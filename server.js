@@ -903,7 +903,15 @@ app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
 
 app.post("/api/payments/mpesa/initiate", auth, async (req, res) => {
   try {
-    const { phone, amount, taskId } = req.body;
+    const { phone, amount, taskId, currency = "KES" } = req.body;
+
+const paymentCurrency = String(currency).trim().toUpperCase();
+
+if (paymentCurrency !== "KES") {
+  return res.status(400).json({
+    error: "M-Pesa only supports KES payments"
+  });
+}
 
     const paymentAmount = Number(amount);
 
