@@ -247,7 +247,17 @@ app.get("/api/health", async (req, res) => {
 });
 
 app.post("/api/auth/register", async (req, res) => {
-  const { name, email, phone, password } = req.body;
+  const {
+    name,
+    email,
+    phone,
+    password,
+    country_code
+  } = req.body;
+
+  const countryCode = String(country_code || "KE")
+    .trim()
+    .toUpperCase();
 
   if (!name || !email || !password || password.length < 8) {
     return res.status(400).json({
@@ -255,14 +265,21 @@ app.post("/api/auth/register", async (req, res) => {
     });
   }
 
+  if (!/^[A-Z]{2}$/.test(countryCode)) {
+    return res.status(400).json({
+      error: "Valid two-letter country code required"
+    });
+  }
+
   try {
     const hash = await bcrypt.hash(password, 12);
 
     const r = await pool.query(
-      `INSERT INTO users(name,email,phone,password_hash)
-       VALUES($1,$2,$3,$4)
+      `INSERT INTO users
+       (name, email, phone, password_hash, country_code)
+       VALUES($1, $2, $3, $4, $5)
        RETURNING id`,
-      [name, email, phone || null, hash]
+      [name, email, phone || null, hash, countryCode]
     );
 
     const id = r.rows[0].id;
@@ -280,6 +297,7 @@ app.post("/api/auth/register", async (req, res) => {
         name,
         email,
         phone,
+        country_code: countryCode,
         role: "USER"
       }
     });
@@ -291,6 +309,7 @@ app.post("/api/auth/register", async (req, res) => {
     });
   }
 });
+
 
 app.post("/api/auth/login", async (req, res) => {
   try {
