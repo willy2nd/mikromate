@@ -115,6 +115,55 @@ async function initDatabase() {
       reward INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'PENDING'
     );
+    
+    -- MikroMate multi-currency wallets
+    CREATE TABLE IF NOT EXISTS wallets(
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      currency VARCHAR(3) NOT NULL
+        CHECK(currency ~ '^[A-Z]{3}$'),
+      balance NUMERIC(14,2) NOT NULL DEFAULT 0
+        CHECK(balance >= 0),
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, currency)
+    );
+
+    -- Wallet transaction ledger
+    CREATE TABLE IF NOT EXISTS wallet_transactions(
+      id SERIAL PRIMARY KEY,
+      wallet_id INTEGER NOT NULL REFERENCES wallets(id),
+      transaction_type TEXT NOT NULL
+        CHECK(transaction_type IN (
+          'DEPOSIT',
+          'TASK_PAYMENT',
+          'TASK_EARNING',
+          'WITHDRAWAL',
+          'REFUND',
+          'ADJUSTMENT'
+        )),
+      amount NUMERIC(14,2) NOT NULL CHECK(amount > 0),
+      status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK(status IN (
+          'PENDING',
+          'COMPLETED',
+          'FAILED',
+          'REVERSED'
+        )),
+      provider TEXT,
+      provider_reference TEXT,
+      description TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP,
+      UNIQUE(provider, provider_reference)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_wallets_user_id
+    ON wallets(user_id);
+
+    CREATE INDEX IF NOT EXISTS idx_wallet_transactions_wallet_id
+    ON wallet_transactions(wallet_id);
+
     -- International country support
 ALTER TABLE users
 ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) NOT NULL DEFAULT 'KE';
@@ -128,6 +177,18 @@ ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES';
 
 ALTER TABLE transactions
 ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES';
+-- M-PESA payment verification fields
+ALTER TABLE transactions
+ADD COLUMN IF NOT EXISTS provider_receipt TEXT;
+
+ALTER TABLE transactions
+ADD COLUMN IF NOT EXISTS payment_phone TEXT;
+
+-- Prevent duplicate M-PESA receipts
+CREATE UNIQUE INDEX IF NOT EXISTS
+idx_transactions_provider_receipt
+ON transactions(provider_receipt)
+WHERE provider_receipt IS NOT NULL;
 
 -- Prepare monetary fields for decimal amounts
 ALTER TABLE tasks
@@ -932,10 +993,20 @@ if (paymentCurrency !== "KES") {
       });
     }
 
+    
     const result = await pool.query(
       `INSERT INTO transactions
-       (task_id,payer_id,gross_amount,platform_fee,provider_amount,status)
-       VALUES($1,$2,$3,$4,$5,'PAYMENT_PENDING')
+       (
+         task_id,
+         payer_id,
+         gross_amount,
+         platform_fee,
+         provider_amount,
+         status,
+         currency,
+         payment_phone
+       )
+       VALUES($1,$2,$3,$4,$5,'PAYMENT_PENDING',$6,$7)
        RETURNING id`,
       [
         taskId || 0,
@@ -944,9 +1015,12 @@ if (paymentCurrency !== "KES") {
         Math.round(paymentAmount * feePct / 100),
         Math.round(
           paymentAmount - (paymentAmount * feePct / 100)
-        )
+        ),
+        paymentCurrency,
+        phone.trim()
       ]
     );
+
 
     const transactionId = result.rows[0].id;
 
