@@ -506,45 +506,89 @@ app.post("/api/tasks", auth, async (req, res) => {
     description,
     category,
     reward,
+    currency = "KES",
     featured
   } = req.body;
 
   const amount = Number(reward);
+  const taskCurrency = String(currency).trim().toUpperCase();
+    const supportedCurrencies = new Set([
+    "KES",
+    "USD",
+    "UGX",
+    "TZS",
+    "RWF",
+    "ZAR",
+    "GBP",
+    "EUR"
+  ]);
 
   if (
     !title ||
     !description ||
     !category ||
     !Number.isFinite(amount) ||
-    amount < 50
+    amount <= 0 ||
+    !supportedCurrencies.has(taskCurrency)
   ) {
     return res.status(400).json({
-      error: "Invalid task"
+      error: "Invalid task details or currency"
+    });
+  }
+
+  if (
+    (taskCurrency === "KES" && amount < 50) ||
+    (taskCurrency !== "KES" && amount < 1)
+  ) {
+    return res.status(400).json({
+      error: "Minimum reward is 50 KES or 1 unit of other currencies"
     });
   }
 
   try {
+    const userResult = await pool.query(
+      "SELECT country_code FROM users WHERE id=$1",
+      [req.user.id]
+    );
+
+    if (!userResult.rows.length) {
+      return res.status(404).json({
+        error: "User account not found"
+      });
+    }
+
+    const countryCode =
+      userResult.rows[0].country_code || "KE";
+
     const result = await pool.query(
       `INSERT INTO tasks
-       (owner_id,title,description,category,reward,featured)
-       VALUES($1,$2,$3,$4,$5,$6)
+       (owner_id, title, description, category,
+        reward, featured, country_code, currency)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
        RETURNING *`,
       [
         req.user.id,
         title,
         description,
         category,
-        Math.round(amount),
-        featured ? 1 : 0
+        amount,
+        featured ? 1 : 0,
+        countryCode,
+        taskCurrency
       ]
     );
 
     res.status(201).json(result.rows[0]);
+
   } catch (e) {
     console.error("Create task error:", e);
-    res.status(500).json({ error: "Unable to create task" });
+
+    res.status(500).json({
+      error: "Unable to create task"
+    });
   }
 });
+
 
 app.post("/api/tasks/:id/accept", auth, async (req, res) => {
   const client = await pool.connect();
