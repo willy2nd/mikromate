@@ -521,6 +521,257 @@ app.post(
   }
 );
 
+app.get("/reset-password", async (req, res) => {
+  const token = String(req.query.token || "");
+
+  res.set({
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer"
+  });
+
+  if (!/^[a-f0-9]{64}$/.test(token)) {
+    return res.status(400).send(
+      "Invalid or expired password reset link."
+    );
+  }
+
+  try {
+    const tokenHash = createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const result = await pool.query(
+      `SELECT id FROM password_reset_tokens
+       WHERE token_hash = $1
+       AND used_at IS NULL
+       AND expires_at > CURRENT_TIMESTAMP
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (!result.rows.length) {
+      return res.status(400).send(
+        "This password reset link is invalid, expired, or already used."
+      );
+    }
+
+    return res.type("html").send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>MikroMate Password Reset</title>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            max-width: 420px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f7fa;
+          }
+          form {
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+          }
+          input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12px;
+            margin: 8px 0 18px;
+          }
+          button {
+            width: 100%;
+            padding: 13px;
+            background: #087f5b;
+            color: white;
+            border: 0;
+            border-radius: 6px;
+            font-size: 16px;
+          }
+        </style>
+      </head>
+      <body>
+        <h2>Reset your MikroMate password</h2>
+        <p>Enter and confirm your new password below.</p>
+
+        <form method="POST" action="/api/auth/reset-password">
+          <input
+            type="hidden"
+            name="token"
+            value="${token}"
+          >
+
+          <label>New password</label>
+          <input
+            type="password"
+            name="password"
+            minlength="8"
+            autocomplete="new-password"
+            required
+          >
+
+          <label>Confirm new password</label>
+          <input
+            type="password"
+            name="confirmPassword"
+            minlength="8"
+            autocomplete="new-password"
+            required
+          >
+
+          <button type="submit">Reset password</button>
+        </form>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error("Reset page error:", error.message);
+
+    return res.status(500).send(
+      "Unable to open the password reset page. Please try again."
+    );
+  }
+});
+
+app.post(
+  "/api/auth/reset-password",
+  resetPasswordLimiter,
+  async (req, res) => {
+    const token = String(req.body?.token || "");
+    const password =
+      typeof req.body?.password === "string"
+        ? req.body.password
+        : "";
+    const confirmPassword =
+      typeof req.body?.confirmPassword === "string"
+        ? req.body.confirmPassword
+        : "";
+
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+      return res.status(400).send(
+        "Invalid or expired password reset link."
+      );
+    }
+
+    if (
+      password.length < 8 ||
+      Buffer.byteLength(password, "utf8") > 72
+    ) {
+      return res.status(400).send(
+        "Your password must contain at least 8 characters and cannot exceed 72 bytes."
+      );
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).send(
+        "The passwords do not match. Please go back and try again."
+      );
+    }
+
+    let client;
+    let transactionStarted = false;
+
+    try {
+      const tokenHash = createHash("sha256")
+        .update(token)
+        .digest("hex");
+
+      const passwordHash = await bcrypt.hash(password, 12);
+
+      client = await pool.connect();
+
+      await client.query("BEGIN");
+      transactionStarted = true;
+
+      const result = await client.query(
+        `SELECT id, user_id
+         FROM password_reset_tokens
+         WHERE token_hash = $1
+         AND used_at IS NULL
+         AND expires_at > CURRENT_TIMESTAMP
+         FOR UPDATE`,
+        [tokenHash]
+      );
+
+      if (!result.rows.length) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(400).send(
+          "This password reset link is invalid, expired, or already used."
+        );
+      }
+
+      const userId = result.rows[0].user_id;
+
+      await client.query(
+        `UPDATE users
+         SET password_hash = $1
+         WHERE id = $2`,
+        [passwordHash, userId]
+      );
+
+      await client.query(
+        `UPDATE password_reset_tokens
+         SET used_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1
+         AND used_at IS NULL`,
+        [userId]
+      );
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      res.set("Cache-Control", "no-store");
+
+      return res.type("html").send(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport"
+                content="width=device-width, initial-scale=1">
+          <title>Password Reset Successful</title>
+        </head>
+        <body style="font-family:Arial,sans-serif;
+                     text-align:center;padding:40px;">
+          <h2>MikroMate Password Reset Successful</h2>
+          <p>Your password has been changed successfully.</p>
+          <p>You can now return to the MikroMate app
+             and log in using your new password.</p>
+        </body>
+        </html>
+      `);
+    } catch (error) {
+      if (client && transactionStarted) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "Password reset rollback failed:",
+            rollbackError.message
+          );
+        }
+      }
+
+      console.error(
+        "Password reset error:",
+        error.message
+      );
+
+      return res.status(500).send(
+        "Unable to reset your password. Please try again."
+      );
+    } finally {
+      if (client) {
+        client.release();
+      }
+    }
+  }
+);
+
 app.post("/api/auth/login", async (req, res) => {
   try {
     const email = String(req.body.email || "")
