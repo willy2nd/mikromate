@@ -384,6 +384,7 @@ app.post("/api/auth/register", async (req, res) => {
 
 
 
+
 app.post("/api/auth/login", async (req, res) => {
   try {
     const email = String(req.body.email || "")
@@ -407,10 +408,17 @@ app.post("/api/auth/login", async (req, res) => {
 
     const u = result.rows[0];
 
-    if (
-      !u ||
-      !(await bcrypt.compare(password, u.password_hash))
-    ) {
+    const passwordMatched = u
+      ? await bcrypt.compare(password, u.password_hash)
+      : false;
+
+    // Temporary diagnostic
+    console.log("LOGIN DIAGNOSTIC:", {
+      accountFound: !!u,
+      passwordMatched
+    });
+
+    if (!u || !passwordMatched) {
       return res.status(401).json({
         error: "Invalid credentials"
       });
@@ -444,6 +452,7 @@ app.post("/api/auth/login", async (req, res) => {
     });
   }
 });
+
 
 
 app.get("/api/me", auth, async (req, res) => {
