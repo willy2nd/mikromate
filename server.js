@@ -5,6 +5,8 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
+import nodemailer from "nodemailer";
+import { randomBytes, createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import { getAccessToken, stkPush } from "./mpesa.js";
@@ -37,7 +39,17 @@ const pool = new Pool({
 app.use(helmet());
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "10kb" }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 465),
+  secure: process.env.SMTP_SECURE === "true",
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
 
 async function initDatabase() {
   await pool.query(`
@@ -115,6 +127,17 @@ async function initDatabase() {
       reward INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'PENDING'
     );
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id
+    ON password_reset_tokens(user_id);
     
     -- MikroMate multi-currency wallets
     CREATE TABLE IF NOT EXISTS wallets(
