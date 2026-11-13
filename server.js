@@ -50,6 +50,19 @@ const mailer = nodemailer.createTransport({
     pass: process.env.SMTP_PASS
   }
 });
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const resetPasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 async function initDatabase() {
   await pool.query(`
@@ -435,11 +448,7 @@ app.post("/api/auth/login", async (req, res) => {
       ? await bcrypt.compare(password, u.password_hash)
       : false;
 
-    // Temporary diagnostic
-    console.log("LOGIN DIAGNOSTIC:", {
-      accountFound: !!u,
-      passwordMatched
-    });
+      
 
     if (!u || !passwordMatched) {
       return res.status(401).json({
