@@ -421,6 +421,106 @@ app.post("/api/auth/register", async (req, res) => {
 
 
 
+app.post(
+  "/api/auth/forgot-password",
+  forgotPasswordLimiter,
+  async (req, res) => {
+    const message =
+      "If an account exists for that email, a password reset link has been sent.";
+
+    try {
+      const email = String(req.body?.email || "")
+        .trim()
+        .toLowerCase();
+
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(200).json({ message });
+      }
+
+      const result = await pool.query(
+        `SELECT id, email FROM users
+         WHERE LOWER(TRIM(email)) = $1
+         LIMIT 1`,
+        [email]
+      );
+
+      const user = result.rows[0];
+
+      if (!user) {
+        return res.status(200).json({ message });
+      }
+
+      const token = randomBytes(32).toString("hex");
+
+      const tokenHash = createHash("sha256")
+        .update(token)
+        .digest("hex");
+
+      const expiresAt = new Date(Date.now() + 20 * 60 * 1000);
+
+      await pool.query(
+        `UPDATE password_reset_tokens
+         SET used_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND used_at IS NULL`,
+        [user.id]
+      );
+
+      await pool.query(
+        `INSERT INTO password_reset_tokens
+         (user_id, token_hash, expires_at)
+         VALUES ($1, $2, $3)`,
+        [user.id, tokenHash, expiresAt]
+      );
+
+      const baseUrl = (
+        process.env.APP_BASE_URL ||
+        "https://mikromate.onrender.com"
+      ).replace(/\/+$/, "");
+
+      const resetUrl =
+        `${baseUrl}/reset-password?token=${token}`;
+
+      try {
+        await mailer.sendMail({
+          from: process.env.SMTP_USER,
+          to: user.email,
+          subject: "MikroMate Password Reset",
+          text:
+            `You requested a MikroMate password reset.\n\n` +
+            `Open this link to reset your password:\n${resetUrl}\n\n` +
+            `This link expires in 20 minutes. ` +
+            `If you did not request this, ignore this email.`,
+          html: `
+            <p>You requested a MikroMate password reset.</p>
+            <p>
+              <a href="${resetUrl}">Reset your MikroMate password</a>
+            </p>
+            <p>This link expires in 20 minutes.</p>
+            <p>If you did not request this, ignore this email.</p>
+          `
+        });
+      } catch (mailError) {
+        await pool.query(
+          `UPDATE password_reset_tokens
+           SET used_at = CURRENT_TIMESTAMP
+           WHERE token_hash = $1`,
+          [tokenHash]
+        );
+
+        console.error(
+          "Password reset email delivery failed:",
+          mailError.message
+        );
+      }
+
+      return res.status(200).json({ message });
+    } catch (error) {
+      console.error("Forgot password error:", error.message);
+      return res.status(200).json({ message });
+    }
+  }
+);
+
 app.post("/api/auth/login", async (req, res) => {
   try {
     const email = String(req.body.email || "")
