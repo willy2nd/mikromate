@@ -87,6 +87,7 @@ fun MikroMateApp() {
 
     var loading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
+    var successMessage by remember { mutableStateOf("") }
 
     val scope = rememberCoroutineScope()
 
@@ -188,6 +189,47 @@ fun MikroMateApp() {
                             keyboardType = KeyboardType.Password
                         )
                     )
+                    if (!isRegister) {
+    TextButton(
+        onClick = {
+            errorMessage = ""
+            successMessage = ""
+
+            if (email.isBlank()) {
+                errorMessage = "Please enter your email address first."
+                return@TextButton
+            }
+
+            loading = true
+
+            scope.launch {
+                try {
+                    val data = JSONObject().apply {
+                        put("email", email.trim())
+                    }
+
+                    authenticate(
+                        "/api/auth/forgot-password",
+                        data
+                    )
+
+                    successMessage =
+                        "If your account exists, a password reset link has been sent to your email. Please check your inbox."
+
+                } catch (e: Exception) {
+                    errorMessage =
+                        e.message ?: "Unable to process your request."
+                } finally {
+                    loading = false
+                }
+            }
+        },
+        enabled = !loading,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text("Forgot Password?")
+    }
+                    }
 
                     Spacer(Modifier.height(18.dp))
 
@@ -197,6 +239,13 @@ fun MikroMateApp() {
                             color = MaterialTheme.colorScheme.error
                         )
                         Spacer(Modifier.height(12.dp))
+                    }
+                    if (successMessage.isNotBlank()) {
+    Text(
+        successMessage,
+        color = MaterialTheme.colorScheme.primary
+    )
+    Spacer(Modifier.height(12.dp))
                     }
 
                     Button(
@@ -309,9 +358,10 @@ fun MikroMateApp() {
 
                     TextButton(
                         onClick = {
-                            isRegister = !isRegister
-                            errorMessage = ""
-                        },
+    isRegister = !isRegister
+    errorMessage = ""
+    successMessage = ""
+},
                         enabled = !loading,
                         modifier = Modifier.fillMaxWidth()
                     ) {
