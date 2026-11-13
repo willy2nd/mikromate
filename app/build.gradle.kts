@@ -1,3 +1,4 @@
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -16,12 +17,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
     defaultConfig {
         applicationId = "com.mikromate.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 500
-        versionName = "5.0.0"
+        versionCode = 501
+        versionName = "5.0.1"
     }
 }
 
@@ -31,5 +33,12 @@ dependencies {
     implementation("androidx.compose.ui:ui:1.9.0")
     implementation("androidx.compose.material3:material3:1.3.2")
     implementation("androidx.compose.ui:ui-tooling-preview:1.9.0")
+
+    // Network communication
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Background network operations
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
     debugImplementation("androidx.compose.ui:ui-tooling:1.9.0")
 }
