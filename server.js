@@ -383,21 +383,33 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 
+
 app.post("/api/auth/login", async (req, res) => {
   try {
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
+
+    const password = req.body.password || "";
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: "Email and password are required"
+      });
+    }
+
     const result = await pool.query(
-      "SELECT * FROM users WHERE email=$1",
-      [req.body.email]
+      `SELECT * FROM users
+       WHERE LOWER(TRIM(email)) = $1
+       LIMIT 1`,
+      [email]
     );
 
     const u = result.rows[0];
 
     if (
       !u ||
-      !(await bcrypt.compare(
-        req.body.password || "",
-        u.password_hash
-      ))
+      !(await bcrypt.compare(password, u.password_hash))
     ) {
       return res.status(401).json({
         error: "Invalid credentials"
@@ -414,7 +426,7 @@ app.post("/api/auth/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
-    res.json({
+    return res.json({
       token,
       user: {
         id: u.id,
@@ -427,9 +439,12 @@ app.post("/api/auth/login", async (req, res) => {
     });
   } catch (e) {
     console.error("Login error:", e);
-    res.status(500).json({ error: "Login failed" });
+    return res.status(500).json({
+      error: "Login failed"
+    });
   }
 });
+
 
 app.get("/api/me", auth, async (req, res) => {
   try {
