@@ -334,26 +334,40 @@ fun MikroMateApp() {
         }
     }
 
-    fun applyForTask(task: MikroTask) {
-        scope.launch {
-            busy = true
-            val result = apiRequest(
-                "/api/tasks/${task.id}/applications",
-                "POST",
-                JSONObject().put(
-                    "message",
-                    "I am interested in this task."
-                ),
-                token
-            )
-            message = if (result.success) {
-                "Your application was submitted."
-            } else {
-                "Application failed. You may already have applied or the task is unavailable."
+fun applyForTask(task: MikroTask) {
+    scope.launch {
+        busy = true
+        message = "Submitting your application..."
+
+        val result = apiRequest(
+            "/api/tasks/${task.id}/applications",
+            "POST",
+            JSONObject().put(
+                "message",
+                "I am interested in this task."
+            ),
+            token
+        )
+
+        message = if (result.success) {
+            "Your application was submitted."
+        } else {
+            try {
+                JSONObject(result.data).optString(
+                    "error",
+                    "Application failed. Please try again."
+                ).ifBlank {
+                    "Application failed. Please try again."
+                }
+            } catch (_: Exception) {
+                "Application failed. Please try again."
             }
-            busy = false
         }
+
+        busy = false
     }
+}
+
 
     fun postTask() {
         val reward = taskReward.toDoubleOrNull()
