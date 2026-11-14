@@ -5,7 +5,7 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
-import nodemailer from "nodemailer";
+
 import { randomBytes, createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -15,6 +15,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = __dirname;
 const app = express();
+
+app.set("trust proxy", 1);
 const port = Number(process.env.PORT) || 10000;
 const feePct = Number(process.env.PLATFORM_FEE_PERCENT || 10);
 const jwtSecret = process.env.JWT_SECRET;
@@ -41,15 +43,7 @@ app.use(cors({ origin: true }));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false, limit: "10kb" }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
-const mailer = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 465),
-  secure: process.env.SMTP_SECURE === "true",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
+
 const forgotPasswordLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -481,24 +475,49 @@ app.post(
         `${baseUrl}/reset-password?token=${token}`;
 
       try {
-        await mailer.sendMail({
-          from: process.env.SMTP_USER,
-          to: user.email,
-          subject: "MikroMate Password Reset",
-          text:
-            `You requested a MikroMate password reset.\n\n` +
-            `Open this link to reset your password:\n${resetUrl}\n\n` +
-            `This link expires in 20 minutes. ` +
-            `If you did not request this, ignore this email.`,
-          html: `
-            <p>You requested a MikroMate password reset.</p>
-            <p>
-              <a href="${resetUrl}">Reset your MikroMate password</a>
-            </p>
-            <p>This link expires in 20 minutes.</p>
-            <p>If you did not request this, ignore this email.</p>
-          `
-        });
+        const emailResponse = await fetch(
+          "https://api.resend.com/emails",
+          {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              from: "MikroMate <onboarding@resend.dev>",
+              to: [user.email],
+              subject: "MikroMate Password Reset",
+              text:
+                `You requested a MikroMate password reset.\n\n` +
+                `Open this link to reset your password:\n${resetUrl}\n\n` +
+                `This link expires in 20 minutes. ` +
+                `If you did not request this, ignore this email.`,
+              html: `
+                <p>You requested a MikroMate password reset.</p>
+                <p>
+                  <a href="${resetUrl}">Reset your MikroMate password</a>
+                </p>
+                <p>This link expires in 20 minutes.</p>
+                <p>If you did not request this, ignore this email.</p>
+              `
+            })
+          }
+        );
+
+        if (!emailResponse.ok) {
+          const errorDetails = await emailResponse.text();
+          throw new Error(
+            `Resend API error ${emailResponse.status}: ${errorDetails}`
+          );
+        }
+
+        const emailResult = await emailResponse.json();
+
+        console.log(
+          "Password reset email accepted by Resend:",
+          emailResult.id
+        );
+
       } catch (mailError) {
         await pool.query(
           `UPDATE password_reset_tokens
