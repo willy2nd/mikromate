@@ -10,8 +10,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -20,401 +18,751 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 
 private const val API_BASE_URL = "https://mikromate.onrender.com"
 
 private val httpClient = OkHttpClient()
+private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-private val jsonType =
-    "application/json; charset=utf-8".toMediaType()
+data class MikroTask(
+    val id: String,
+    val title: String,
+    val description: String,
+    val category: String,
+    val reward: String,
+    val currency: String,
+    val owner: String
+)
+
+data class MikroApplication(
+    val title: String,
+    val status: String,
+    val reward: String,
+    val currency: String
+)
+
+private data class ApiResult(
+    val success: Boolean,
+    val data: String
+)
+
+private suspend fun apiRequest(
+    endpoint: String,
+    method: String = "GET",
+    body: JSONObject? = null,
+    token: String? = null
+): ApiResult = withContext(Dispatchers.IO) {
+    try {
+        val builder = Request.Builder()
+            .url("$API_BASE_URL$endpoint")
+            .addHeader("Accept", "application/json")
+
+        if (!token.isNullOrBlank()) {
+            builder.addHeader("Authorization", "Bearer $token")
+        }
+
+        when (method) {
+            "POST" -> builder.post(
+                (body ?: JSONObject()).toString().toRequestBody(jsonMediaType)
+            )
+            else -> builder.get()
+        }
+
+        httpClient.newCall(builder.build()).execute().use { response ->
+            ApiResult(
+                success = response.isSuccessful,
+                data = response.body?.string().orEmpty()
+            )
+        }
+    } catch (e: Exception) {
+        ApiResult(false, e.message ?: "Network connection failed")
+    }
+}
+
+private fun parseTasks(json: String): List<MikroTask> {
+    return try {
+        val root = JSONObject(json)
+        val array = root.optJSONArray("tasks")
+            ?: root.optJSONArray("data")
+            ?: JSONArray()
+
+        buildList {
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                add(
+                    MikroTask(
+                        id = item.optString("id"),
+                        title = item.optString("title", "Untitled task"),
+                        description = item.optString("description"),
+                        category = item.optString("category", "General"),
+                        reward = item.optString("reward", "0"),
+                        currency = item.optString("currency", "KES"),
+                        owner = item.optString(
+                            "owner_name",
+                            item.optString("name", "MikroMate user")
+                        )
+                    )
+                )
+            }
+        }
+    } catch (e: Exception) {
+        try {
+            val array = JSONArray(json)
+            buildList {
+                for (i in 0 until array.length()) {
+                    val item = array.optJSONObject(i) ?: continue
+                    add(
+                        MikroTask(
+                            id = item.optString("id"),
+                            title = item.optString("title", "Untitled task"),
+                            description = item.optString("description"),
+                            category = item.optString("category", "General"),
+                            reward = item.optString("reward", "0"),
+                            currency = item.optString("currency", "KES"),
+                            owner = item.optString("owner_name", "MikroMate user")
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+}
+
+private fun parseApplications(json: String): List<MikroApplication> {
+    return try {
+        val root = JSONObject(json)
+        val array = root.optJSONArray("applications")
+            ?: root.optJSONArray("data")
+            ?: JSONArray()
+
+        buildList {
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val task = item.optJSONObject("task")
+
+                add(
+                    MikroApplication(
+                        title = item.optString(
+                            "title",
+                            task?.optString("title", "Task application")
+                                ?: "Task application"
+                        ),
+                        status = item.optString("status", "PENDING"),
+                        reward = item.optString(
+                            "reward",
+                            task?.optString("reward", "0") ?: "0"
+                        ),
+                        currency = item.optString(
+                            "currency",
+                            task?.optString("currency", "KES") ?: "KES"
+                        )
+                    )
+                )
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MikroMateApp()
+            MaterialTheme {
+                MikroMateApp()
+            }
         }
-    }
-}
-
-private suspend fun authenticate(
-    endpoint: String,
-    data: JSONObject
-): JSONObject = withContext(Dispatchers.IO) {
-
-    val body = data.toString().toRequestBody(jsonType)
-
-    val request = Request.Builder()
-        .url("$API_BASE_URL$endpoint")
-        .post(body)
-        .build()
-
-    httpClient.newCall(request).execute().use { response ->
-
-        val result = response.body?.string().orEmpty()
-        val json = if (result.isNotBlank()) {
-            JSONObject(result)
-        } else {
-            JSONObject()
-        }
-
-        if (!response.isSuccessful) {
-            throw Exception(
-                json.optString(
-                    "error",
-                    "Request failed: ${response.code}"
-                )
-            )
-        }
-
-        json
     }
 }
 
 @Composable
 fun MikroMateApp() {
-    var token by remember { mutableStateOf<String?>(null) }
+    var token by remember { mutableStateOf("") }
     var userName by remember { mutableStateOf("") }
     var userEmail by remember { mutableStateOf("") }
 
-    var isRegister by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf("") }
+    var page by remember { mutableStateOf("Login") }
+    var selectedTab by remember { mutableStateOf("Home") }
+
     var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var fullName by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
     var countryCode by remember { mutableStateOf("KE") }
-    var password by remember { mutableStateOf("") }
 
-    var loading by remember { mutableStateOf(false) }
-    var errorMessage by remember { mutableStateOf("") }
-    var successMessage by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+
+    var tasks by remember { mutableStateOf<List<MikroTask>>(emptyList()) }
+    var applications by remember {
+        mutableStateOf<List<MikroApplication>>(emptyList())
+    }
+
+    var taskTitle by remember { mutableStateOf("") }
+    var taskDescription by remember { mutableStateOf("") }
+    var taskCategory by remember { mutableStateOf("General") }
+    var taskReward by remember { mutableStateOf("") }
+    var taskCurrency by remember { mutableStateOf("KES") }
 
     val scope = rememberCoroutineScope()
 
-    MaterialTheme {
-        Surface(
-            modifier = Modifier.fillMaxSize()
-        ) {
-            if (token == null) {
+    fun loadTasks() {
+        scope.launch {
+            busy = true
+            val result = apiRequest("/api/tasks")
+            if (result.success) {
+                tasks = parseTasks(result.data)
+                message = ""
+            } else {
+                message = "Could not load tasks. Please try again."
+            }
+            busy = false
+        }
+    }
 
+    fun loadApplications() {
+        scope.launch {
+            busy = true
+            val result = apiRequest(
+                "/api/my-applications",
+                token = token
+            )
+            if (result.success) {
+                applications = parseApplications(result.data)
+                message = ""
+            } else {
+                message = "Could not load your applications."
+            }
+            busy = false
+        }
+    }
+
+    fun loginOrRegister(register: Boolean) {
+        if (email.isBlank() || password.isBlank()) {
+            message = "Please enter your email and password."
+            return
+        }
+
+        if (register && fullName.isBlank()) {
+            message = "Please enter your full name."
+            return
+        }
+
+        scope.launch {
+            busy = true
+            message = "Connecting to MikroMate..."
+
+            val body = JSONObject().apply {
+                put("email", email.trim())
+                put("password", password)
+                if (register) {
+                    put("name", fullName.trim())
+                    put("phone", phone.trim())
+                    put("country_code", countryCode.trim().uppercase())
+                }
+            }
+
+            val endpoint = if (register) {
+                "/api/auth/register"
+            } else {
+                "/api/auth/login"
+            }
+
+            val result = apiRequest(endpoint, "POST", body)
+
+            if (result.success) {
+                try {
+                    val response = JSONObject(result.data)
+                    token = response.optString("token")
+                    val user = response.optJSONObject("user")
+
+                    userName = user?.optString("name", fullName)
+                        ?: fullName
+                    userEmail = user?.optString("email", email)
+                        ?: email
+
+                    if (token.isBlank()) {
+                        message = "The server did not return a login token."
+                    } else {
+                        page = "Marketplace"
+                        selectedTab = "Home"
+                        message = "Welcome to MikroMate!"
+                        loadTasks()
+                    }
+                } catch (_: Exception) {
+                    message = "Could not read the server response."
+                }
+            } else {
+                message = try {
+                    JSONObject(result.data).optString(
+                        "error",
+                        "Login or registration failed. Please check your details."
+                    )
+                } catch (_: Exception) {
+                    "Connection failed. Please try again."
+                }
+            }
+
+            busy = false
+        }
+    }
+
+    fun requestPasswordReset() {
+        if (email.isBlank()) {
+            message = "Enter your email address first."
+            return
+        }
+
+        scope.launch {
+            busy = true
+            val result = apiRequest(
+                "/api/auth/forgot-password",
+                "POST",
+                JSONObject().put("email", email.trim())
+            )
+            message = if (result.success) {
+                "If the account exists, a password reset link has been sent to your email."
+            } else {
+                "We could not request a reset link. Please try again."
+            }
+            busy = false
+        }
+    }
+
+    fun applyForTask(task: MikroTask) {
+        scope.launch {
+            busy = true
+            val result = apiRequest(
+                "/api/tasks/${task.id}/applications",
+                "POST",
+                JSONObject().put(
+                    "message",
+                    "I am interested in this task."
+                ),
+                token
+            )
+            message = if (result.success) {
+                "Your application was submitted."
+            } else {
+                "Application failed. You may already have applied or the task is unavailable."
+            }
+            busy = false
+        }
+    }
+
+    fun postTask() {
+        val reward = taskReward.toDoubleOrNull()
+
+        if (taskTitle.isBlank() ||
+            taskDescription.isBlank() ||
+            reward == null ||
+            reward <= 0
+        ) {
+            message = "Enter a title, description and valid reward."
+            return
+        }
+
+        scope.launch {
+            busy = true
+            val body = JSONObject().apply {
+                put("title", taskTitle.trim())
+                put("description", taskDescription.trim())
+                put("category", taskCategory.trim())
+                put("reward", reward)
+                put("currency", taskCurrency)
+            }
+
+            val result = apiRequest(
+                "/api/tasks",
+                "POST",
+                body,
+                token
+            )
+
+            if (result.success) {
+                message = "Your task has been posted."
+                taskTitle = ""
+                taskDescription = ""
+                taskReward = ""
+                selectedTab = "Browse"
+                loadTasks()
+            } else {
+                message = try {
+                    JSONObject(result.data).optString(
+                        "error",
+                        "Could not post your task."
+                    )
+                } catch (_: Exception) {
+                    "Could not post your task. Please try again."
+                }
+            }
+            busy = false
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        if (page == "Login" || page == "Register") {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(22.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    "MikroMate",
+                    style = MaterialTheme.typography.headlineLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text("Your tasks. Your opportunities.")
+
+                Spacer(Modifier.height(24.dp))
+
+                Text(
+                    if (page == "Login") "Welcome back" else "Create your account",
+                    style = MaterialTheme.typography.headlineSmall
+                )
+
+                if (page == "Register") {
+                    OutlinedTextField(
+                        value = fullName,
+                        onValueChange = { fullName = it },
+                        label = { Text("Full name") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = phone,
+                        onValueChange = { phone = it },
+                        label = { Text("Phone number") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = countryCode,
+                        onValueChange = { countryCode = it },
+                        label = { Text("Country code (e.g. KE)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = { email = it },
+                    label = { Text("Email address") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(16.dp))
+
+                Button(
+                    onClick = {
+                        loginOrRegister(page == "Register")
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        if (busy) "Please wait..."
+                        else if (page == "Login") "Log in"
+                        else "Create account"
+                    )
+                }
+
+                TextButton(
+                    onClick = {
+                        page = if (page == "Login") "Register" else "Login"
+                        message = ""
+                    }
+                ) {
+                    Text(
+                        if (page == "Login") {
+                            "Don't have an account? Register"
+                        } else {
+                            "Already have an account? Log in"
+                        }
+                    )
+                }
+
+                TextButton(
+                    onClick = { requestPasswordReset() },
+                    enabled = !busy
+                ) {
+                    Text("Forgot password?")
+                }
+
+                if (message.isNotBlank()) {
+                    Text(
+                        message,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        } else {
+            Column(modifier = Modifier.fillMaxSize()) {
                 Column(
                     modifier = Modifier
-                        .fillMaxSize()
+                        .weight(1f)
                         .verticalScroll(rememberScrollState())
-                        .padding(24.dp),
-                    verticalArrangement = Arrangement.Center
+                        .padding(16.dp)
                 ) {
-
                     Text(
                         "MikroMate",
-                        style = MaterialTheme.typography.headlineLarge
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.primary
                     )
 
-                    Spacer(Modifier.height(8.dp))
-
-                    Text(
-                        "Connect. Work. Earn.",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-
-                    Spacer(Modifier.height(28.dp))
-
-                    Text(
-                        if (isRegister) "Create your account"
-                        else "Welcome back",
-                        style = MaterialTheme.typography.headlineSmall
-                    )
-
-                    Spacer(Modifier.height(16.dp))
-
-                    if (isRegister) {
-                        OutlinedTextField(
-                            value = name,
-                            onValueChange = { name = it },
-                            label = { Text("Full name") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = !loading
-                        )
-
-                        Spacer(Modifier.height(10.dp))
-
-                        OutlinedTextField(
-                            value = phone,
-                            onValueChange = { phone = it },
-                            label = { Text("Phone number (optional)") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = !loading
-                        )
-
-                        Spacer(Modifier.height(10.dp))
-
-                        OutlinedTextField(
-                            value = countryCode,
-                            onValueChange = {
-                                countryCode = it.uppercase().take(2)
-                            },
-                            label = { Text("Country code (e.g. KE)") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = !loading
-                        )
-
-                        Spacer(Modifier.height(10.dp))
-                    }
-
-                    OutlinedTextField(
-                        value = email,
-                        onValueChange = { email = it },
-                        label = { Text("Email address") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        enabled = !loading,
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Email
-                        )
-                    )
-
-                    Spacer(Modifier.height(10.dp))
-
-                    OutlinedTextField(
-                        value = password,
-                        onValueChange = { password = it },
-                        label = { Text("Password") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        enabled = !loading,
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Password
-                        )
-                    )
-                    if (!isRegister) {
-    TextButton(
-        onClick = {
-            errorMessage = ""
-            successMessage = ""
-
-            if (email.isBlank()) {
-                errorMessage = "Please enter your email address first."
-                return@TextButton
-            }
-
-            loading = true
-
-            scope.launch {
-                try {
-                    val data = JSONObject().apply {
-                        put("email", email.trim())
-                    }
-
-                    authenticate(
-                        "/api/auth/forgot-password",
-                        data
-                    )
-
-                    successMessage =
-                        "If your account exists, a password reset link has been sent to your email. Please check your inbox."
-
-                } catch (e: Exception) {
-                    errorMessage =
-                        e.message ?: "Unable to process your request."
-                } finally {
-                    loading = false
-                }
-            }
-        },
-        enabled = !loading,
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Text("Forgot Password?")
-    }
-                    }
-
-                    Spacer(Modifier.height(18.dp))
-
-                    if (errorMessage.isNotBlank()) {
+                    if (message.isNotBlank()) {
                         Text(
-                            errorMessage,
-                            color = MaterialTheme.colorScheme.error
+                            message,
+                            color = MaterialTheme.colorScheme.primary
                         )
-                        Spacer(Modifier.height(12.dp))
-                    }
-                    if (successMessage.isNotBlank()) {
-    Text(
-        successMessage,
-        color = MaterialTheme.colorScheme.primary
-    )
-    Spacer(Modifier.height(12.dp))
+                        Spacer(Modifier.height(8.dp))
                     }
 
-                    Button(
-                        onClick = {
-                            errorMessage = ""
+                    when (selectedTab) {
+                        "Home" -> {
+                            Text(
+                                "Welcome, $userName!",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Text("Find opportunities. Offer your skills. Get tasks done.")
+                            Spacer(Modifier.height(20.dp))
 
-                            if (email.isBlank() ||
-                                password.isBlank() ||
-                                (isRegister && name.isBlank())
+                            Button(
+                                onClick = {
+                                    selectedTab = "Browse"
+                                    loadTasks()
+                                },
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                errorMessage =
-                                    "Please complete all required fields."
-                                return@Button
+                                Text("Browse available tasks")
                             }
 
-                            if (isRegister && password.length < 8) {
-                                errorMessage =
-                                    "Password must contain at least 8 characters."
-                                return@Button
-                            }
-
-                            if (isRegister &&
-                                !Regex("^[A-Z]{2}$").matches(countryCode)
+                            OutlinedButton(
+                                onClick = { selectedTab = "Post" },
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                errorMessage =
-                                    "Enter a valid two-letter country code."
-                                return@Button
+                                Text("Post a new task")
                             }
 
-                            loading = true
+                            OutlinedButton(
+                                onClick = {
+                                    selectedTab = "Applications"
+                                    loadApplications()
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("View my applications")
+                            }
+                        }
 
-                            scope.launch {
-                                try {
-                                    val data = JSONObject().apply {
-                                        put("email", email.trim())
-                                        put("password", password)
+                        "Browse" -> {
+                            Text(
+                                "Available Tasks",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
 
-                                        if (isRegister) {
-                                            put("name", name.trim())
-                                            put("country_code", countryCode)
+                            Button(
+                                onClick = { loadTasks() },
+                                enabled = !busy
+                            ) {
+                                Text("Refresh tasks")
+                            }
 
-                                            if (phone.isNotBlank()) {
-                                                put("phone", phone.trim())
-                                            }
+                            if (busy) {
+                                CircularProgressIndicator()
+                            } else if (tasks.isEmpty()) {
+                                Text("No available tasks were returned. Try refreshing later.")
+                            }
+
+                            tasks.forEach { task ->
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 7.dp)
+                                ) {
+                                    Column(Modifier.padding(14.dp)) {
+                                        Text(
+                                            task.title,
+                                            style = MaterialTheme.typography.titleLarge
+                                        )
+                                        Text("Category: ${task.category}")
+                                        Text(task.description)
+                                        Text("Posted by: ${task.owner}")
+                                        Text(
+                                            "Reward: ${task.currency} ${task.reward}",
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Spacer(Modifier.height(8.dp))
+                                        Button(
+                                            onClick = { applyForTask(task) },
+                                            enabled = !busy
+                                        ) {
+                                            Text("Apply for this task")
                                         }
                                     }
-
-                                    val endpoint = if (isRegister) {
-                                        "/api/auth/register"
-                                    } else {
-                                        "/api/auth/login"
-                                    }
-
-                                    val result = authenticate(
-                                        endpoint,
-                                        data
-                                    )
-
-                                    val account =
-                                        result.optJSONObject("user")
-
-                                    val receivedToken =
-                                        result.optString("token")
-
-                                    if (receivedToken.isBlank()) {
-                                        throw Exception(
-                                            "The server did not return a login token."
-                                        )
-                                    }
-
-                                    token = receivedToken
-                                    userName = account?.optString(
-                                        "name",
-                                        name
-                                    ) ?: name
-
-                                    userEmail = account?.optString(
-                                        "email",
-                                        email
-                                    ) ?: email
-
-                                    password = ""
-                                    errorMessage = ""
-
-                                } catch (e: Exception) {
-                                    errorMessage =
-                                        e.message ?: "Connection failed."
-                                } finally {
-                                    loading = false
                                 }
                             }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        enabled = !loading
-                    ) {
-                        if (loading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(20.dp),
-                                strokeWidth = 2.dp
-                            )
-                        } else {
-                            Text(
-                                if (isRegister) "Create Account"
-                                else "Login"
-                            )
                         }
-                    }
 
-                    Spacer(Modifier.height(12.dp))
+                        "Post" -> {
+                            Text(
+                                "Post a Task",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+                            Text("Describe the work and set its reward.")
 
-                    TextButton(
-                        onClick = {
-    isRegister = !isRegister
-    errorMessage = ""
-    successMessage = ""
-},
-                        enabled = !loading,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            if (isRegister)
-                                "Already registered? Login"
-                            else
-                                "New to MikroMate? Create an account"
-                        )
+                            OutlinedTextField(
+                                value = taskTitle,
+                                onValueChange = { taskTitle = it },
+                                label = { Text("Task title") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = taskDescription,
+                                onValueChange = { taskDescription = it },
+                                label = { Text("Task description") },
+                                modifier = Modifier.fillMaxWidth(),
+                                minLines = 3
+                            )
+                            OutlinedTextField(
+                                value = taskCategory,
+                                onValueChange = { taskCategory = it },
+                                label = { Text("Category") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = taskReward,
+                                onValueChange = { taskReward = it },
+                                label = { Text("Reward amount") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = taskCurrency,
+                                onValueChange = {
+                                    taskCurrency = it.uppercase()
+                                },
+                                label = { Text("Currency (KES, USD, UGX, TZS, RWF, ZAR, GBP, EUR)") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+
+                            Spacer(Modifier.height(12.dp))
+
+                            Button(
+                                onClick = { postTask() },
+                                enabled = !busy,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Publish task")
+                            }
+                        }
+
+                        "Applications" -> {
+                            Text(
+                                "My Applications",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+
+                            Button(
+                                onClick = { loadApplications() },
+                                enabled = !busy
+                            ) {
+                                Text("Refresh applications")
+                            }
+
+                            if (busy) {
+                                CircularProgressIndicator()
+                            } else if (applications.isEmpty()) {
+                                Text("No applications were returned yet.")
+                            }
+
+                            applications.forEach { application ->
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 6.dp)
+                                ) {
+                                    Column(Modifier.padding(14.dp)) {
+                                        Text(
+                                            application.title,
+                                            style = MaterialTheme.typography.titleMedium
+                                        )
+                                        Text("Status: ${application.status}")
+                                        Text(
+                                            "Reward: ${application.currency} ${application.reward}"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        "Profile" -> {
+                            Text(
+                                "My Profile",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            Text("Name: $userName")
+                            Text("Email: $userEmail")
+                            Text("Account connected to MikroMate.")
+
+                            Spacer(Modifier.height(20.dp))
+
+                            Button(
+                                onClick = {
+                                    token = ""
+                                    userName = ""
+                                    userEmail = ""
+                                    page = "Login"
+                                    selectedTab = "Home"
+                                    message = "You have logged out."
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Log out")
+                            }
+                        }
                     }
                 }
 
-            } else {
+                HorizontalDivider()
 
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(24.dp),
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Text(
-                        "Welcome to MikroMate!",
-                        style = MaterialTheme.typography.headlineMedium
-                    )
-
-                    Spacer(Modifier.height(16.dp))
-
-                    Text("Hello, $userName")
-
-                    Spacer(Modifier.height(8.dp))
-
-                    Text("Account: $userEmail")
-
-                    Spacer(Modifier.height(20.dp))
-
-                    Text(
-                        "Your account is connected to the MikroMate service.",
-                        style = MaterialTheme.typography.bodyLarge
-                    )
-
-                    Spacer(Modifier.height(24.dp))
-
-                    Button(
-                        onClick = {
-                            token = null
-                            userName = ""
-                            userEmail = ""
-                            email = ""
-                            password = ""
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Logout")
+                NavigationBar {
+                    listOf(
+                        "Home",
+                        "Browse",
+                        "Post",
+                        "Applications",
+                        "Profile"
+                    ).forEach { tab ->
+                        NavigationBarItem(
+                            selected = selectedTab == tab,
+                            onClick = {
+                                selectedTab = tab
+                                message = ""
+                                when (tab) {
+                                    "Browse" -> loadTasks()
+                                    "Applications" -> loadApplications()
+                                }
+                            },
+                            icon = {},
+                            label = { Text(tab) }
+                        )
                     }
                 }
             }
