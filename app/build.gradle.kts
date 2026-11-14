@@ -22,8 +22,8 @@ android {
         applicationId = "com.mikromate.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 501
-        versionName = "5.0.1"
+        versionCode = 502
+        versionName = "5.0.2"
     }
 }
 
