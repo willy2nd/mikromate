@@ -132,12 +132,19 @@ private fun parseTasks(json: String): List<MikroTask> {
     }
 }
 
+
 private fun parseApplications(json: String): List<MikroApplication> {
     return try {
-        val root = JSONObject(json)
-        val array = root.optJSONArray("applications")
-            ?: root.optJSONArray("data")
-            ?: JSONArray()
+        val array = try {
+            // Handle the raw JSON array returned by the API
+            JSONArray(json)
+        } catch (_: Exception) {
+            // Also support wrapped API responses
+            val root = JSONObject(json)
+            root.optJSONArray("applications")
+                ?: root.optJSONArray("data")
+                ?: JSONArray()
+        }
 
         buildList {
             for (i in 0 until array.length()) {
@@ -151,7 +158,10 @@ private fun parseApplications(json: String): List<MikroApplication> {
                             task?.optString("title", "Task application")
                                 ?: "Task application"
                         ),
-                        status = item.optString("status", "PENDING"),
+                        status = item.optString(
+                            "application_status",
+                            item.optString("status", "PENDING")
+                        ),
                         reward = item.optString(
                             "reward",
                             task?.optString("reward", "0") ?: "0"
@@ -164,10 +174,11 @@ private fun parseApplications(json: String): List<MikroApplication> {
                 )
             }
         }
-    } catch (_: Exception) {
+    } catch (e: Exception) {
         emptyList()
     }
 }
+
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
