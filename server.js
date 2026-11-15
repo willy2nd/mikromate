@@ -901,47 +901,52 @@ app.get("/api/tasks", async (req, res) => {
 
 app.post("/api/tasks/:id/applications", auth, async (req, res) => {
   const taskId = Number(req.params.id);
-  const message = String(req.body.message || "").trim();
+  const message = String(req.body?.message || "").trim();
 
   if (!Number.isInteger(taskId) || taskId <= 0) {
-    return res.status(400).json({
-      error: "Invalid job ID"
-    });
+    return res.status(400).json({ error: "Invalid job ID" });
   }
 
   if (message.length > 1000) {
-    return res.status(400).json({
-      error: "Application message is too long"
-    });
+    return res.status(400).json({ error: "Application message is too long" });
   }
 
+  let client;
+  let transactionStarted = false;
+
   try {
-    const taskResult = await pool.query(
-      "SELECT id, owner_id, status, worker_capacity FROM tasks WHERE id=$1",
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    // Use the same task-row lock as accept/reject decisions. This serializes
+    // capacity checks with applications and prevents stale capacity reads.
+    const taskResult = await client.query(
+      `SELECT id, owner_id, status, worker_capacity
+       FROM tasks WHERE id=$1 FOR UPDATE`,
       [taskId]
     );
-
     const task = taskResult.rows[0];
 
     if (!task) {
-      return res.status(404).json({
-        error: "Job not found"
-      });
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Job not found" });
     }
 
     if (task.status !== "OPEN") {
-      return res.status(409).json({
-        error: "This job is no longer available"
-      });
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({ error: "This job is no longer available" });
     }
 
     if (Number(task.owner_id) === Number(req.user.id)) {
-      return res.status(403).json({
-        error: "You cannot apply for your own job"
-      });
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(403).json({ error: "You cannot apply for your own job" });
     }
 
-    const acceptedResult = await pool.query(
+    const acceptedResult = await client.query(
       `SELECT COUNT(*)::int AS accepted_workers
        FROM task_applications
        WHERE task_id=$1 AND status='ACCEPTED'`,
@@ -954,12 +959,14 @@ app.post("/api/tasks/:id/applications", auth, async (req, res) => {
     );
 
     if (remainingPositions <= 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
       return res.status(409).json({
         error: "All worker positions for this job have been filled"
       });
     }
 
-    const result = await pool.query(
+    const result = await client.query(
       `INSERT INTO task_applications
        (task_id, applicant_id, message)
        VALUES($1, $2, $3)
@@ -969,22 +976,35 @@ app.post("/api/tasks/:id/applications", auth, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
       return res.status(409).json({
         error: "You have already applied for this job"
       });
     }
 
-    res.status(201).json({
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return res.status(201).json({
       message: "Job application submitted successfully",
       application: result.rows[0]
     });
-
   } catch (e) {
-    console.error("Job application error:", e);
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Application submission rollback failed:", rollbackError);
+      }
+    }
 
-    res.status(500).json({
+    console.error("Job application error:", e);
+    return res.status(500).json({
       error: "Unable to submit job application"
     });
+  } finally {
+    if (client) client.release();
   }
 });
 
