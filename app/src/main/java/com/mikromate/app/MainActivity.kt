@@ -37,6 +37,7 @@ data class MikroTask(
 )
 
 data class MikroApplication(
+    val taskId: String,
     val title: String,
     val status: String,
     val reward: String,
@@ -160,6 +161,7 @@ private fun parseApplications(json: String): List<MikroApplication> {
 
                 add(
                     MikroApplication(
+                        taskId = item.optString("task_id"),
                         title = item.optString(
                             "title",
                             task?.optString("title", "Task application")
@@ -243,6 +245,7 @@ fun MikroMateApp() {
     var busy by remember { mutableStateOf(false) }
 
     var tasks by remember { mutableStateOf<List<MikroTask>>(emptyList()) }
+    var appliedTaskIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var applications by remember {
         mutableStateOf<List<MikroApplication>>(emptyList())
     }
@@ -282,6 +285,7 @@ fun MikroMateApp() {
             )
             if (result.success) {
                 applications = parseApplications(result.data)
+                appliedTaskIds = appliedTaskIds + applications.map { it.taskId }.filter { it.isNotBlank() }
                 message = ""
             } else {
                 message = "Could not load your applications."
@@ -417,36 +421,49 @@ fun MikroMateApp() {
     }
 
 fun applyForTask(task: MikroTask) {
+    if (task.id in appliedTaskIds || busy) return
+
     scope.launch {
+        if (task.id in appliedTaskIds || busy) return@launch
         busy = true
         message = "Submitting your application..."
 
-        val result = apiRequest(
-            "/api/tasks/${task.id}/applications",
-            "POST",
-            JSONObject().put(
-                "message",
-                "I am interested in this task."
-            ),
-            token
-        )
+        try {
+            val result = apiRequest(
+                "/api/tasks/${task.id}/applications",
+                "POST",
+                JSONObject().put(
+                    "message",
+                    "I am interested in this task."
+                ),
+                token
+            )
 
-        message = if (result.success) {
-            "Your application was submitted."
-        } else {
-            try {
-                JSONObject(result.data).optString(
-                    "error",
-                    "Application failed. Please try again."
-                ).ifBlank {
+            if (result.success) {
+                appliedTaskIds = appliedTaskIds + task.id
+                message = "Your application was submitted."
+            } else {
+                val error = try {
+                    JSONObject(result.data).optString(
+                        "error",
+                        "Application failed. Please try again."
+                    ).ifBlank {
+                        "Application failed. Please try again."
+                    }
+                } catch (_: Exception) {
                     "Application failed. Please try again."
                 }
-            } catch (_: Exception) {
-                "Application failed. Please try again."
-            }
-        }
 
-        busy = false
+                if (error.contains("already applied", ignoreCase = true)) {
+                    appliedTaskIds = appliedTaskIds + task.id
+                    message = "You have already applied for this task."
+                } else {
+                    message = error
+                }
+            }
+        } finally {
+            busy = false
+        }
     }
 }
 
@@ -718,9 +735,12 @@ fun applyForTask(task: MikroTask) {
                                         Spacer(Modifier.height(8.dp))
                                         Button(
                                             onClick = { applyForTask(task) },
-                                            enabled = !busy
+                                            enabled = !busy && task.id !in appliedTaskIds
                                         ) {
-                                            Text("Apply for this task")
+                                            Text(
+                                                if (task.id in appliedTaskIds) "Applied"
+                                                else "Apply for this task"
+                                            )
                                         }
                                     }
                                 }
