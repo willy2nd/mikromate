@@ -1419,6 +1419,13 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
       });
     }
 
+    if (Number(task.worker_capacity || 1) > 1) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "This task requires poster selection from submitted applications. Apply for the task and wait for the poster to review your application."
+      });
+    }
+
     if (Number(task.owner_id) === Number(req.user.id)) {
       await client.query("ROLLBACK");
       return res.status(400).json({
