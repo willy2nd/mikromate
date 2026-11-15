@@ -83,6 +83,11 @@ async function initDatabase() {
       featured INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+        -- Maximum number of workers allowed for each task
+    ALTER TABLE tasks
+    ADD COLUMN IF NOT EXISTS worker_capacity
+    INTEGER NOT NULL DEFAULT 1
+    CHECK (worker_capacity >= 1);
     
     CREATE TABLE IF NOT EXISTS task_applications(
       id SERIAL PRIMARY KEY,
@@ -1005,10 +1010,22 @@ app.post("/api/tasks", auth, async (req, res) => {
     category,
     reward,
     currency = "KES",
-    featured
+    featured,
+    worker_capacity = 1
   } = req.body;
 
   const amount = Number(reward);
+    const workerCapacity = Number(worker_capacity);
+
+  if (
+    !Number.isInteger(workerCapacity) ||
+    workerCapacity < 1 ||
+    workerCapacity > 100
+  ) {
+    return res.status(400).json({
+      error: "Worker capacity must be between 1 and 100"
+    });
+  }
   const taskCurrency = String(currency).trim().toUpperCase();
     const supportedCurrencies = new Set([
     "KES",
@@ -1059,10 +1076,10 @@ app.post("/api/tasks", auth, async (req, res) => {
       userResult.rows[0].country_code || "KE";
 
     const result = await pool.query(
-      `INSERT INTO tasks
+            `INSERT INTO tasks
        (owner_id, title, description, category,
-        reward, featured, country_code, currency)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        reward, featured, country_code, currency, worker_capacity)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
       [
         req.user.id,
@@ -1072,7 +1089,8 @@ app.post("/api/tasks", auth, async (req, res) => {
         amount,
         featured ? 1 : 0,
         countryCode,
-        taskCurrency
+        taskCurrency,
+        workerCapacity
       ]
     );
 
