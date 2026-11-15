@@ -901,6 +901,7 @@ fun applyForTask(task: MikroTask) {
                         "Home",
                         "Browse",
                         "Post",
+                        "Applications",
                         "Received",
                         "Profile"
                     ).forEach { tab ->
