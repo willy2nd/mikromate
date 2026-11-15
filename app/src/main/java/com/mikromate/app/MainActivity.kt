@@ -268,6 +268,15 @@ fun MikroMateApp() {
             val result = apiRequest("/api/tasks")
             if (result.success) {
                 tasks = parseTasks(result.data)
+                val myApplications = apiRequest(
+                    "/api/my-applications",
+                    token = token
+                )
+                if (myApplications.success) {
+                    val loadedApplications = parseApplications(myApplications.data)
+                    applications = loadedApplications
+                    appliedTaskIds = appliedTaskIds + loadedApplications.map { it.taskId }.filter { it.isNotBlank() }
+                }
                 message = ""
             } else {
                 message = "Could not load tasks. Please try again."
