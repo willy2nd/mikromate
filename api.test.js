@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 const serverSource = readFileSync(new URL("./server.js", import.meta.url), "utf8");
 
@@ -115,4 +116,21 @@ test("task and M-PESA amounts use exact minor-unit arithmetic", () => {
   assert.match(serverSource, /parseMoneyToMinorUnits\(reward\)/);
   assert.match(serverSource, /calculateFeeMinorUnits\(paymentMinorUnits, feePct\)/);
   assert.match(serverSource, /!Number\.isSafeInteger\(paymentAmount\)/);
+});
+
+
+test("server.js and money.js pass Node syntax validation", () => {
+  for (const file of ["server.js", "money.js", "mpesa.js"]) {
+    const result = spawnSync(process.execPath, ["--check", file], {
+      encoding: "utf8"
+    });
+    assert.equal(result.status, 0, `${file} syntax error: ${result.stderr}`);
+  }
+});
+
+test("fee rounding remains precise for large valid amounts", () => {
+  const gross = 99999999999999;
+  const fee = calculateFeeMinorUnits(gross, 10);
+  assert.equal(fee, 10000000000000);
+  assert.equal(fee + (gross - fee), gross);
 });
