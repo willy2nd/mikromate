@@ -109,6 +109,7 @@ test("database startup migration is transactional and guards duplicate receipts"
   assert.match(migration, /await client\.query\("COMMIT"\)/);
   assert.match(migration, /await client\.query\("ROLLBACK"\)/);
   assert.match(migration, /HAVING COUNT\(\*\) > 1/);
+  assert.match(migration, /DO \\$\\$/);
   assert.match(migration, /client\.release\(\)/);
 });
 
