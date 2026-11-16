@@ -33,5 +33,6 @@ export function calculateFeeMinorUnits(amountMinorUnits, percent) {
   if (!Number.isSafeInteger(basisPoints) || basisPoints > 10000) {
     throw new RangeError("Platform fee must be between 0 and 100 percent");
   }
-  return Math.round(amountMinorUnits * basisPoints / 10000);
+  const feeMinorUnits = (BigInt(amountMinorUnits) * BigInt(basisPoints) + 5000n) / 10000n;
+  return Number(feeMinorUnits);
 }
