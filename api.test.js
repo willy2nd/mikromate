@@ -110,6 +110,7 @@ test("database startup migration is transactional and guards duplicate receipts"
   assert.match(migration, /await client\.query\("ROLLBACK"\)/);
   assert.match(migration, /HAVING COUNT\(\*\) > 1/);
   assert.match(migration, /DO \$\$/);
+  assert.doesNotMatch(migration, /DO \$(?!\$)/, "DO block must use paired PostgreSQL dollar quotes");
   assert.match(migration, /client\.release\(\)/);
 });
 
