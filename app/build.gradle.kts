@@ -22,8 +22,19 @@ android {
         applicationId = "com.mikromate.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 503
-        versionName = "5.0.3"
+        versionCode = 504
+        versionName = "5.0.4"
+        resValue("string", "app_name", "MikroMate")
+    }
+    buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+            resValue("string", "app_name", "MikroMate Debug")
+        }
+        release {
+            // Release builds retain the production application ID and signing identity.
+        }
     }
 }
 
