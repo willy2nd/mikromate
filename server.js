@@ -11,6 +11,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { getAccessToken, stkPush } from "./mpesa.js";
 import { parseWorkerCapacity, getRemainingWorkerSlots } from "./worker-capacity.js";
+import { parseMoneyToMinorUnits, formatMinorUnits, calculateFeeMinorUnits } from "./money.js";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -60,7 +61,12 @@ const resetPasswordLimiter = rateLimit({
 });
 
 async function initDatabase() {
-  await pool.query(`
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    await client.query(`
     CREATE TABLE IF NOT EXISTS users(
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -221,6 +227,18 @@ ADD COLUMN IF NOT EXISTS provider_receipt TEXT;
 ALTER TABLE transactions
 ADD COLUMN IF NOT EXISTS payment_phone TEXT;
 
+DO $
+BEGIN
+  IF EXISTS (
+    SELECT provider_receipt FROM transactions
+    WHERE provider_receipt IS NOT NULL
+    GROUP BY provider_receipt HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'Cannot create unique M-PESA receipt index: duplicate provider_receipt values exist. Resolve duplicates before retrying migration.';
+  END IF;
+END
+$;
+
 -- Prevent duplicate M-PESA receipts
 CREATE UNIQUE INDEX IF NOT EXISTS
 idx_transactions_provider_receipt
@@ -254,9 +272,19 @@ USING platform_fee::NUMERIC(14,2);
 ALTER TABLE transactions
 ALTER COLUMN provider_amount TYPE NUMERIC(14,2)
 USING provider_amount::NUMERIC(14,2);
-  `);
-
-  console.log("PostgreSQL database initialized");
+    `);
+    await client.query("COMMIT");
+    transactionStarted = false;
+    console.log("PostgreSQL database initialized");
+  } catch (error) {
+    if (transactionStarted) {
+      try { await client.query("ROLLBACK"); }
+      catch (rollbackError) { console.error("Database migration rollback failed:", rollbackError.message); }
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 function auth(req, res, next) {
@@ -1330,7 +1358,8 @@ app.post("/api/tasks", auth, async (req, res) => {
   const workerCapacityInput =
     req.body.worker_capacity ?? req.body.workerCapacity ?? 1;
   const workerCapacity = parseWorkerCapacity(workerCapacityInput);
-  const amount = Number(reward);
+  const amountMinorUnits = parseMoneyToMinorUnits(reward);
+  const amount = amountMinorUnits === null ? null : formatMinorUnits(amountMinorUnits);
   const taskCurrency = String(currency).trim().toUpperCase();
     const supportedCurrencies = new Set([
     "KES",
@@ -1347,8 +1376,8 @@ app.post("/api/tasks", auth, async (req, res) => {
     !title ||
     !description ||
     !category ||
-    !Number.isFinite(amount) ||
-    amount <= 0 ||
+    amountMinorUnits === null ||
+    amountMinorUnits <= 0 ||
     workerCapacity === null ||
     !supportedCurrencies.has(taskCurrency)
   ) {
@@ -1358,8 +1387,8 @@ app.post("/api/tasks", auth, async (req, res) => {
   }
 
   if (
-    (taskCurrency === "KES" && amount < 50) ||
-    (taskCurrency !== "KES" && amount < 1)
+    (taskCurrency === "KES" && amountMinorUnits < 5000) ||
+    (taskCurrency !== "KES" && amountMinorUnits < 100)
   ) {
     return res.status(400).json({
       error: "Minimum reward is 50 KES or 1 unit of other currencies"
@@ -1453,11 +1482,15 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
       });
     }
 
-    const fee = Math.round(
-      Number(task.reward) * feePct / 100
-    );
-
-    const provider = Number(task.reward) - fee;
+    const rewardMinorUnits = parseMoneyToMinorUnits(String(task.reward));
+    if (rewardMinorUnits === null) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: "Task reward has an invalid stored amount" });
+    }
+    const feeMinorUnits = calculateFeeMinorUnits(rewardMinorUnits, feePct);
+    const providerMinorUnits = rewardMinorUnits - feeMinorUnits;
+    const fee = formatMinorUnits(feeMinorUnits);
+    const provider = formatMinorUnits(providerMinorUnits);
 
     await client.query(
       `UPDATE tasks
@@ -1475,7 +1508,7 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
         task.id,
         task.owner_id,
         req.user.id,
-        task.reward,
+        formatMinorUnits(rewardMinorUnits),
         fee,
         provider
       ]
@@ -1489,7 +1522,7 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
     res.json({
       transaction_id: transactionId,
       task_id: task.id,
-      gross_amount: task.reward,
+      gross_amount: formatMinorUnits(rewardMinorUnits),
       platform_fee: fee,
       provider_amount: provider,
       status: "PAYMENT_PENDING"
@@ -1742,9 +1775,11 @@ if (paymentCurrency !== "KES") {
   });
 }
 
-    const paymentAmount = Number(amount);
+    const paymentMinorUnits = parseMoneyToMinorUnits(amount);
+    const paymentAmount = paymentMinorUnits === null ? null : paymentMinorUnits / 100;
 
-    if (!phone || !Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+    if (!phone || paymentAmount === null || paymentAmount <= 0 ||
+        !Number.isSafeInteger(paymentAmount)) {
       return res.status(400).json({
         error: "Phone and valid amount are required"
       });
@@ -1768,11 +1803,9 @@ if (paymentCurrency !== "KES") {
       [
         taskId || 0,
         req.user.id,
-        Math.round(paymentAmount),
-        Math.round(paymentAmount * feePct / 100),
-        Math.round(
-          paymentAmount - (paymentAmount * feePct / 100)
-        ),
+        formatMinorUnits(paymentMinorUnits),
+        formatMinorUnits(calculateFeeMinorUnits(paymentMinorUnits, feePct)),
+        formatMinorUnits(paymentMinorUnits - calculateFeeMinorUnits(paymentMinorUnits, feePct)),
         paymentCurrency,
         phone.trim()
       ]
