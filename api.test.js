@@ -66,3 +66,53 @@ test("capacity availability is based on accepted workers", () => {
   assert.equal(hasAvailableWorkerCapacity(3, 2), true);
   assert.equal(hasAvailableWorkerCapacity(3, 3), false);
 });
+
+
+import {
+  parseMoneyToMinorUnits,
+  formatMinorUnits,
+  calculateFeeMinorUnits
+} from "./money.js";
+
+test("money parsing preserves exact two-decimal amounts", () => {
+  assert.equal(parseMoneyToMinorUnits("50"), 5000);
+  assert.equal(parseMoneyToMinorUnits("50.05"), 5005);
+  assert.equal(parseMoneyToMinorUnits(12.3), 1230);
+  assert.equal(formatMinorUnits(5005), "50.05");
+});
+
+test("money parsing rejects invalid precision and unsafe values", () => {
+  for (const value of ["", "-1", "1.234", "1e3", "abc", null, true, "90071992547409.92"]) {
+    assert.equal(parseMoneyToMinorUnits(value), null);
+  }
+});
+
+test("platform fee and provider amount reconcile exactly", () => {
+  const gross = parseMoneyToMinorUnits("123.45");
+  const fee = calculateFeeMinorUnits(gross, 10);
+  assert.equal(formatMinorUnits(fee), "12.35");
+  assert.equal(formatMinorUnits(gross - fee), "111.10");
+  assert.equal(fee + (gross - fee), gross);
+});
+
+test("platform fee validates configured percentage", () => {
+  assert.throws(() => calculateFeeMinorUnits(10000, -1));
+  assert.throws(() => calculateFeeMinorUnits(10000, 100.01));
+});
+
+test("database startup migration is transactional and guards duplicate receipts", () => {
+  const start = serverSource.indexOf("async function initDatabase()");
+  const end = serverSource.indexOf("\nfunction auth(", start);
+  const migration = serverSource.slice(start, end);
+  assert.match(migration, /await client\.query\("BEGIN"\)/);
+  assert.match(migration, /await client\.query\("COMMIT"\)/);
+  assert.match(migration, /await client\.query\("ROLLBACK"\)/);
+  assert.match(migration, /HAVING COUNT\(\*\) > 1/);
+  assert.match(migration, /client\.release\(\)/);
+});
+
+test("task and M-PESA amounts use exact minor-unit arithmetic", () => {
+  assert.match(serverSource, /parseMoneyToMinorUnits\(reward\)/);
+  assert.match(serverSource, /calculateFeeMinorUnits\(paymentMinorUnits, feePct\)/);
+  assert.match(serverSource, /!Number\.isSafeInteger\(paymentAmount\)/);
+});
