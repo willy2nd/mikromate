@@ -1,4 +1,3 @@
-
 name: MikroMate Android Release Build
 
 on:
@@ -58,7 +57,12 @@ jobs:
         with:
           gradle-version: '8.13'
 
-      - name: Build MikroMate Release APK
+      - name: Build MikroMate PR debug APK
+        if: github.event_name == 'pull_request'
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Build MikroMate release APK
+        if: github.event_name != 'pull_request'
         run: gradle :app:assembleRelease --stacktrace
 
       - name: Decode Android signing key
@@ -97,9 +101,9 @@ jobs:
           name: MikroMate-release-APK
           path: app/build/outputs/apk/release/mikromate-release.apk
 
-      - name: Upload unsigned PR verification APK
+      - name: Upload installable PR debug APK
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: MikroMate-pr-verification-APK
-          path: app/build/outputs/apk/release/app-release-unsigned.apk
+          name: MikroMate-pr-debug-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
