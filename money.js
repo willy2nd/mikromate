@@ -3,7 +3,7 @@ const MAX_MINOR_UNITS = 99_999_999_999_999;
 export function parseMoneyToMinorUnits(value) {
   if (typeof value !== "string" && typeof value !== "number") return null;
   const text = String(value).trim();
-  if (!/^\\d+(?:\\.\\d{1,2})?$/.test(text)) return null;
+  if (!/^\d+(?:\.\d{1,2})?$/.test(text)) return null;
   const [whole, fraction = ""] = text.split(".");
   const minor = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
   if (!Number.isSafeInteger(minor) || minor < 0 || minor > MAX_MINOR_UNITS) {
@@ -25,7 +25,7 @@ export function calculateFeeMinorUnits(amountMinorUnits, percent) {
     throw new TypeError("Invalid monetary amount");
   }
   const percentText = String(percent);
-  if (!/^\\d+(?:\\.\\d{1,2})?$/.test(percentText)) {
+  if (!/^\d+(?:\.\d{1,2})?$/.test(percentText)) {
     throw new TypeError("Invalid platform fee percentage");
   }
   const [whole, fraction = ""] = percentText.split(".");
