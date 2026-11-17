@@ -58,7 +58,7 @@ export async function stkPush({
 
   const paymentAmount = Number(amount);
 
-  if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+  if (!Number.isSafeInteger(paymentAmount) || paymentAmount <= 0) {
     throw new Error("Invalid M-PESA payment amount");
   }
 
