@@ -5,6 +5,7 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
+import { lookup } from "node:dns/promises";
 
 import { randomBytes, createHash } from "crypto";
 import path from "path";
@@ -30,6 +31,23 @@ if (!jwtSecret) {
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL is not configured");
   process.exit(1);
+}
+
+try {
+  const dbUrl = new URL(process.env.DATABASE_URL);
+  const resolved = await lookup(dbUrl.hostname).catch((error) => ({
+    error: error.code || "DNS_LOOKUP_FAILED"
+  }));
+  console.log("PostgreSQL target diagnostic:", {
+    hostname: dbUrl.hostname,
+    port: dbUrl.port || "5432",
+    database: dbUrl.pathname.replace(/^\\/+/, ""),
+    resolvedAddress: resolved.address || null,
+    dnsError: resolved.error || null,
+    sslEnabled: process.env.DATABASE_SSL === "true"
+  });
+} catch (error) {
+  console.error("DATABASE_URL diagnostic parse failed:", error.message);
 }
 
 const pool = new Pool({
