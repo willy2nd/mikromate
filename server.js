@@ -41,7 +41,7 @@ try {
   console.log("PostgreSQL target diagnostic:", {
     hostname: dbUrl.hostname,
     port: dbUrl.port || "5432",
-    database: dbUrl.pathname.replace(/^\\/+/, ""),
+    database: dbUrl.pathname.slice(1),
     resolvedAddress: resolved.address || null,
     dnsError: resolved.error || null,
     sslEnabled: process.env.DATABASE_SSL === "true"
