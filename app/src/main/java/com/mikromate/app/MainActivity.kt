@@ -797,6 +797,15 @@ fun applyForTask(task: MikroTask) {
                             ) {
                                 Text("Review received applications")
                             }
+                            OutlinedButton(
+                                onClick = {
+                                    selectedTab = "Wallet"
+                                    loadWallet()
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Open MikroMate Wallet")
+                            }
                         }
 
                         "Wallet" -> {
@@ -1073,10 +1082,8 @@ fun applyForTask(task: MikroTask) {
                     listOf(
                         "Home",
                         "Browse",
-                        "Post",
-                        "Applications",
-                        "Received",
                         "Wallet",
+                        "Post",
                         "Profile"
                     ).forEach { tab ->
                         NavigationBarItem(
