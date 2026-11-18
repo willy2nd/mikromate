@@ -349,70 +349,55 @@ app.get("/api/health", async (req, res) => {
 });
 
 app.post("/api/auth/register", async (req, res) => {
-  const {
-    name,
-    email,
-    phone,
-    password,
-    country_code
-  } = req.body;
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const phoneInput = String(req.body?.phone || "").trim();
+  const phone = phoneInput || null;
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const countryCode = String(req.body?.country_code || "KE").trim().toUpperCase();
 
-  const countryCode = String(country_code || "KE")
-    .trim()
-    .toUpperCase();
-
-  if (!name || !email || !password || password.length < 8) {
-    return res.status(400).json({
-      error: "Name, email and 8+ character password required"
-    });
+  if (name.length < 2 || name.length > 100) {
+    return res.status(400).json({ error: "Please enter your full name (2 to 100 characters)." });
   }
-
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    return res.status(400).json({ error: "Please enter a valid email address." });
+  }
+  if (password.length < 8 || password.length > 128) {
+    return res.status(400).json({ error: "Your password must be between 8 and 128 characters." });
+  }
   if (!/^[A-Z]{2}$/.test(countryCode)) {
-    return res.status(400).json({
-      error: "Valid two-letter country code required"
-    });
+    return res.status(400).json({ error: "Please select a valid country." });
+  }
+  if (phone && phone.length > 30) {
+    return res.status(400).json({ error: "Please enter a valid phone number or leave it blank." });
   }
 
   try {
     const hash = await bcrypt.hash(password, 12);
-
-    const r = await pool.query(
+    const result = await pool.query(
       `INSERT INTO users
        (name, email, phone, password_hash, country_code)
        VALUES($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [name, email, phone || null, hash, countryCode]
+       RETURNING id, name, email, phone, country_code, role`,
+      [name, email, phone, hash, countryCode]
     );
 
-    const id = r.rows[0].id;
-
+    const user = result.rows[0];
     const token = jwt.sign(
-      { id, email, role: "USER" },
+      { id: user.id, email: user.email, role: user.role },
       jwtSecret,
       { expiresIn: "7d" }
     );
 
-    res.status(201).json({
-      token,
-      user: {
-        id,
-        name,
-        email,
-        phone,
-        country_code: countryCode,
-        role: "USER"
-      }
-    });
+    return res.status(201).json({ token, user });
   } catch (e) {
+    if (e.code === "23505") {
+      return res.status(409).json({ error: "That email address or phone number is already registered. Please log in or use different details." });
+    }
     console.error("Registration error:", e);
-
-    res.status(409).json({
-      error: "Email or phone already registered"
-    });
+    return res.status(500).json({ error: "We could not create your account right now. Please try again." });
   }
 });
-
-
 
 
 app.post(
