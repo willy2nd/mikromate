@@ -1539,6 +1539,10 @@ app.post("/api/payments/mpesa/callback", async (req, res) => {
 app.get("/", (req, res) => {
   res.sendFile(path.join(rootDir, "index.html"));
 });
+
+app.get("/admin", (req, res) => {
+  res.sendFile(path.join(rootDir, "admin.html"));
+});
 async function startServer() {
   // Start HTTP server immediately so Render can detect the port.
  
