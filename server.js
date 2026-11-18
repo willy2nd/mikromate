@@ -5,11 +5,14 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
+import { lookup } from "node:dns/promises";
 
 import { randomBytes, createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getAccessToken, stkPush } from "./mpesa.js";
+import { getAccessToken, stkPush, normalizeKenyanPhone, queryStkPush } from "./mpesa.js";
+import { parseWorkerCapacity, getRemainingWorkerSlots } from "./worker-capacity.js";
+import { parseMoneyToMinorUnits, formatMinorUnits, calculateFeeMinorUnits } from "./money.js";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,6 +31,23 @@ if (!jwtSecret) {
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL is not configured");
   process.exit(1);
+}
+
+try {
+  const dbUrl = new URL(process.env.DATABASE_URL);
+  const resolved = await lookup(dbUrl.hostname).catch((error) => ({
+    error: error.code || "DNS_LOOKUP_FAILED"
+  }));
+  console.log("PostgreSQL target diagnostic:", {
+    hostname: dbUrl.hostname,
+    port: dbUrl.port || "5432",
+    database: dbUrl.pathname.slice(1),
+    resolvedAddress: resolved.address || null,
+    dnsError: resolved.error || null,
+    sslEnabled: process.env.DATABASE_SSL === "true"
+  });
+} catch (error) {
+  console.error("DATABASE_URL diagnostic parse failed:", error.message);
 }
 
 const pool = new Pool({
@@ -75,7 +95,12 @@ const resetPasswordLimiter = rateLimit({
 });
 
 async function initDatabase() {
-  await pool.query(`
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    await client.query(`
     CREATE TABLE IF NOT EXISTS users(
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -97,6 +122,7 @@ async function initDatabase() {
       status TEXT NOT NULL DEFAULT 'OPEN',
       provider_id INTEGER,
       featured INTEGER NOT NULL DEFAULT 0,
+      worker_capacity INTEGER NOT NULL DEFAULT 1 CHECK(worker_capacity >= 1),
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     
@@ -210,12 +236,44 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_wallet_transactions_wallet_id
     ON wallet_transactions(wallet_id);
 
+    -- M-PESA deposit reconciliation metadata for wallet ledger entries.
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS payment_phone TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS checkout_request_id TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS merchant_request_id TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS provider_receipt TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS transaction_date TEXT;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_transactions_checkout_request_id
+    ON wallet_transactions(checkout_request_id)
+    WHERE checkout_request_id IS NOT NULL;
+
+    DO $wallet_receipt_guard$
+    BEGIN
+      IF EXISTS (
+        SELECT provider_receipt FROM wallet_transactions
+        WHERE provider_receipt IS NOT NULL
+        GROUP BY provider_receipt HAVING COUNT(*) > 1
+      ) THEN
+        RAISE EXCEPTION 'Duplicate wallet M-PESA receipts exist; resolve them before enabling receipt uniqueness.';
+      END IF;
+    END
+    $wallet_receipt_guard$;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_transactions_provider_receipt
+    ON wallet_transactions(provider_receipt)
+    WHERE provider_receipt IS NOT NULL;
+
     -- International country support
 ALTER TABLE users
 ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) NOT NULL DEFAULT 'KE';
 
 ALTER TABLE tasks
 ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) NOT NULL DEFAULT 'KE';
+
+-- Posters choose how many workers are needed for each task.
+ALTER TABLE tasks
+ADD COLUMN IF NOT EXISTS worker_capacity INTEGER NOT NULL DEFAULT 1
+CHECK (worker_capacity >= 1);
 
 -- Multi-currency support
 ALTER TABLE tasks
@@ -229,6 +287,18 @@ ADD COLUMN IF NOT EXISTS provider_receipt TEXT;
 
 ALTER TABLE transactions
 ADD COLUMN IF NOT EXISTS payment_phone TEXT;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT provider_receipt FROM transactions
+    WHERE provider_receipt IS NOT NULL
+    GROUP BY provider_receipt HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'Cannot create unique M-PESA receipt index: duplicate provider_receipt values exist. Resolve duplicates before retrying migration.';
+  END IF;
+END
+$$;
 
 -- Prevent duplicate M-PESA receipts
 CREATE UNIQUE INDEX IF NOT EXISTS
@@ -263,9 +333,19 @@ USING platform_fee::NUMERIC(14,2);
 ALTER TABLE transactions
 ALTER COLUMN provider_amount TYPE NUMERIC(14,2)
 USING provider_amount::NUMERIC(14,2);
-  `);
-
-  console.log("PostgreSQL database initialized");
+    `);
+    await client.query("COMMIT");
+    transactionStarted = false;
+    console.log("PostgreSQL database initialized");
+  } catch (error) {
+    if (transactionStarted) {
+      try { await client.query("ROLLBACK"); }
+      catch (rollbackError) { console.error("Database migration rollback failed:", rollbackError.message); }
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 function auth(req, res, next) {
@@ -365,55 +445,70 @@ app.get("/api/health", async (req, res) => {
 });
 
 app.post("/api/auth/register", async (req, res) => {
-  const name = String(req.body?.name || "").trim();
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const phoneInput = String(req.body?.phone || "").trim();
-  const phone = phoneInput || null;
-  const password = typeof req.body?.password === "string" ? req.body.password : "";
-  const countryCode = String(req.body?.country_code || "KE").trim().toUpperCase();
+  const {
+    name,
+    email,
+    phone,
+    password,
+    country_code
+  } = req.body;
 
-  if (name.length < 2 || name.length > 100) {
-    return res.status(400).json({ error: "Please enter your full name (2 to 100 characters)." });
+  const countryCode = String(country_code || "KE")
+    .trim()
+    .toUpperCase();
+
+  if (!name || !email || !password || password.length < 8) {
+    return res.status(400).json({
+      error: "Name, email and 8+ character password required"
+    });
   }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
-    return res.status(400).json({ error: "Please enter a valid email address." });
-  }
-  if (password.length < 8 || password.length > 128) {
-    return res.status(400).json({ error: "Your password must be between 8 and 128 characters." });
-  }
+
   if (!/^[A-Z]{2}$/.test(countryCode)) {
-    return res.status(400).json({ error: "Please select a valid country." });
-  }
-  if (phone && phone.length > 30) {
-    return res.status(400).json({ error: "Please enter a valid phone number or leave it blank." });
+    return res.status(400).json({
+      error: "Valid two-letter country code required"
+    });
   }
 
   try {
     const hash = await bcrypt.hash(password, 12);
-    const result = await pool.query(
+
+    const r = await pool.query(
       `INSERT INTO users
        (name, email, phone, password_hash, country_code)
        VALUES($1, $2, $3, $4, $5)
-       RETURNING id, name, email, phone, country_code, role`,
-      [name, email, phone, hash, countryCode]
+       RETURNING id`,
+      [name, email, phone || null, hash, countryCode]
     );
 
-    const user = result.rows[0];
+    const id = r.rows[0].id;
+
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      { id, email, role: "USER" },
       jwtSecret,
       { expiresIn: "7d" }
     );
 
-    return res.status(201).json({ token, user });
+    res.status(201).json({
+      token,
+      user: {
+        id,
+        name,
+        email,
+        phone,
+        country_code: countryCode,
+        role: "USER"
+      }
+    });
   } catch (e) {
-    if (e.code === "23505") {
-      return res.status(409).json({ error: "That email address or phone number is already registered. Please log in or use different details." });
-    }
     console.error("Registration error:", e);
-    return res.status(500).json({ error: "We could not create your account right now. Please try again." });
+
+    res.status(409).json({
+      error: "Email or phone already registered"
+    });
   }
 });
+
+
 
 
 app.post(
@@ -895,47 +990,72 @@ app.get("/api/tasks", async (req, res) => {
 
 app.post("/api/tasks/:id/applications", auth, async (req, res) => {
   const taskId = Number(req.params.id);
-  const message = String(req.body.message || "").trim();
+  const message = String(req.body?.message || "").trim();
 
   if (!Number.isInteger(taskId) || taskId <= 0) {
-    return res.status(400).json({
-      error: "Invalid job ID"
-    });
+    return res.status(400).json({ error: "Invalid job ID" });
   }
 
   if (message.length > 1000) {
-    return res.status(400).json({
-      error: "Application message is too long"
-    });
+    return res.status(400).json({ error: "Application message is too long" });
   }
 
+  let client;
+  let transactionStarted = false;
+
   try {
-    const taskResult = await pool.query(
-      "SELECT id, owner_id, status FROM tasks WHERE id=$1",
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    // Use the same task-row lock as accept/reject decisions. This serializes
+    // capacity checks with applications and prevents stale capacity reads.
+    const taskResult = await client.query(
+      `SELECT id, owner_id, status, worker_capacity
+       FROM tasks WHERE id=$1 FOR UPDATE`,
       [taskId]
     );
-
     const task = taskResult.rows[0];
 
     if (!task) {
-      return res.status(404).json({
-        error: "Job not found"
-      });
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Job not found" });
     }
 
     if (task.status !== "OPEN") {
-      return res.status(409).json({
-        error: "This job is no longer available"
-      });
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({ error: "This job is no longer available" });
     }
 
     if (Number(task.owner_id) === Number(req.user.id)) {
-      return res.status(403).json({
-        error: "You cannot apply for your own job"
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(403).json({ error: "You cannot apply for your own job" });
+    }
+
+    const acceptedResult = await client.query(
+      `SELECT COUNT(*)::int AS accepted_workers
+       FROM task_applications
+       WHERE task_id=$1 AND status='ACCEPTED'`,
+      [taskId]
+    );
+    const acceptedWorkers = Number(acceptedResult.rows[0].accepted_workers);
+    const remainingPositions = getRemainingWorkerSlots(
+      task.worker_capacity,
+      acceptedWorkers
+    );
+
+    if (remainingPositions <= 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({
+        error: "All worker positions for this job have been filled"
       });
     }
 
-    const result = await pool.query(
+    const result = await client.query(
       `INSERT INTO task_applications
        (task_id, applicant_id, message)
        VALUES($1, $2, $3)
@@ -945,22 +1065,35 @@ app.post("/api/tasks/:id/applications", auth, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
       return res.status(409).json({
         error: "You have already applied for this job"
       });
     }
 
-    res.status(201).json({
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return res.status(201).json({
       message: "Job application submitted successfully",
       application: result.rows[0]
     });
-
   } catch (e) {
-    console.error("Job application error:", e);
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Application submission rollback failed:", rollbackError);
+      }
+    }
 
-    res.status(500).json({
+    console.error("Job application error:", e);
+    return res.status(500).json({
       error: "Unable to submit job application"
     });
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -999,6 +1132,280 @@ app.get("/api/my-applications", auth, async (req, res) => {
   }
 });
 
+
+async function loadPosterApplications(req, res, taskId = null) {
+  const result = await pool.query(
+    `SELECT
+       a.id AS application_id,
+       a.task_id,
+       a.message,
+       a.status AS application_status,
+       a.created_at AS applied_at,
+       t.title AS task_title,
+       t.status AS task_status,
+       t.reward,
+       t.currency,
+       t.worker_capacity,
+       (SELECT COUNT(*)::int
+        FROM task_applications accepted
+        WHERE accepted.task_id=t.id
+          AND accepted.status='ACCEPTED') AS accepted_workers,
+       GREATEST(
+         t.worker_capacity -
+         (SELECT COUNT(*)::int
+          FROM task_applications accepted
+          WHERE accepted.task_id=t.id
+            AND accepted.status='ACCEPTED'),
+         0
+       ) AS remaining_positions,
+       u.id AS applicant_id,
+       u.name AS applicant_name,
+       u.phone AS applicant_phone,
+       u.verified AS applicant_verified
+     FROM task_applications a
+     JOIN tasks t ON t.id=a.task_id
+     JOIN users u ON u.id=a.applicant_id
+     WHERE t.owner_id=$1
+       AND ($2::integer IS NULL OR t.id=$2)
+     ORDER BY a.created_at DESC`,
+    [req.user.id, taskId]
+  );
+
+  return res.json({ applications: result.rows });
+}
+
+app.get("/api/poster/applications", auth, async (req, res) => {
+  const taskId = req.query.task_id === undefined
+    ? null
+    : Number(req.query.task_id);
+
+  if (
+    taskId !== null &&
+    (!Number.isInteger(taskId) || taskId <= 0)
+  ) {
+    return res.status(400).json({ error: "Invalid task ID" });
+  }
+
+  try {
+    return await loadPosterApplications(req, res, taskId);
+  } catch (e) {
+    console.error("Poster applications error:", e);
+    return res.status(500).json({
+      error: "Unable to load received applications"
+    });
+  }
+});
+
+app.get("/api/tasks/:id/applications", auth, async (req, res) => {
+  const taskId = Number(req.params.id);
+
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    return res.status(400).json({ error: "Invalid task ID" });
+  }
+
+  try {
+    const taskResult = await pool.query(
+      "SELECT id, owner_id FROM tasks WHERE id=$1",
+      [taskId]
+    );
+    const task = taskResult.rows[0];
+
+    if (!task) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+
+    if (Number(task.owner_id) !== Number(req.user.id)) {
+      return res.status(403).json({
+        error: "You can only view applications for your own tasks"
+      });
+    }
+
+    return await loadPosterApplications(req, res, taskId);
+  } catch (e) {
+    console.error("Task applications error:", e);
+    return res.status(500).json({
+      error: "Unable to load task applications"
+    });
+  }
+});
+
+async function decideTaskApplication(req, res, decision) {
+  const applicationId = Number(req.params.id);
+
+  if (!Number.isInteger(applicationId) || applicationId <= 0) {
+    return res.status(400).json({ error: "Invalid application ID" });
+  }
+
+  let client;
+  let transactionStarted = false;
+
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const applicationLookup = await client.query(
+      "SELECT task_id FROM task_applications WHERE id=$1",
+      [applicationId]
+    );
+
+    if (!applicationLookup.rows.length) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    // Lock the task first so concurrent decisions cannot exceed capacity.
+    const taskResult = await client.query(
+      `SELECT id, owner_id, status, worker_capacity
+       FROM tasks
+       WHERE id=$1
+       FOR UPDATE`,
+      [applicationLookup.rows[0].task_id]
+    );
+    const task = taskResult.rows[0];
+
+    if (!task) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Task not found" });
+    }
+
+    if (Number(task.owner_id) !== Number(req.user.id)) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(403).json({
+        error: "Only the task poster can decide applications"
+      });
+    }
+
+    const applicationResult = await client.query(
+      `SELECT id, task_id, status
+       FROM task_applications
+       WHERE id=$1 AND task_id=$2
+       FOR UPDATE`,
+      [applicationId, task.id]
+    );
+    const application = applicationResult.rows[0];
+
+    if (!application) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    if (application.status !== "PENDING") {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({
+        error: "This application has already been decided",
+        application_status: application.status
+      });
+    }
+
+    let acceptedWorkers = 0;
+
+    if (decision === "ACCEPTED") {
+      if (task.status !== "OPEN") {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+        return res.status(409).json({
+          error: "This task is no longer accepting workers"
+        });
+      }
+
+      const countResult = await client.query(
+        `SELECT COUNT(*)::int AS accepted_workers
+         FROM task_applications
+         WHERE task_id=$1 AND status='ACCEPTED'`,
+        [task.id]
+      );
+      acceptedWorkers = Number(countResult.rows[0].accepted_workers);
+
+      if (!getRemainingWorkerSlots(task.worker_capacity, acceptedWorkers)) {
+        await client.query(
+          "UPDATE tasks SET status='FILLED' WHERE id=$1",
+          [task.id]
+        );
+        await client.query("COMMIT");
+        transactionStarted = false;
+        return res.status(409).json({
+          error: "All worker positions for this task have been filled",
+          worker_capacity: Number(task.worker_capacity),
+          accepted_workers: acceptedWorkers,
+          remaining_positions: 0
+        });
+      }
+    }
+
+    const updatedApplication = await client.query(
+      `UPDATE task_applications
+       SET status=$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2
+       RETURNING id, task_id, applicant_id, message, status, created_at, updated_at`,
+      [decision, applicationId]
+    );
+
+    if (decision === "ACCEPTED") {
+      acceptedWorkers += 1;
+      const remainingPositions = getRemainingWorkerSlots(
+        task.worker_capacity,
+        acceptedWorkers
+      );
+
+      if (remainingPositions === 0) {
+        await client.query(
+          "UPDATE tasks SET status='FILLED' WHERE id=$1",
+          [task.id]
+        );
+      }
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      return res.json({
+        message: "Applicant accepted successfully",
+        application: updatedApplication.rows[0],
+        worker_capacity: Number(task.worker_capacity),
+        accepted_workers: acceptedWorkers,
+        remaining_positions: remainingPositions,
+        task_status: remainingPositions === 0 ? "FILLED" : "OPEN"
+      });
+    }
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return res.json({
+      message: "Applicant rejected successfully",
+      application: updatedApplication.rows[0]
+    });
+  } catch (e) {
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Application decision rollback failed:", rollbackError);
+      }
+    }
+
+    console.error("Application decision error:", e);
+    return res.status(500).json({
+      error: "Unable to update application"
+    });
+  } finally {
+    if (client) client.release();
+  }
+}
+
+app.post("/api/applications/:id/accept", auth, async (req, res) => {
+  return decideTaskApplication(req, res, "ACCEPTED");
+});
+
+app.post("/api/applications/:id/reject", auth, async (req, res) => {
+  return decideTaskApplication(req, res, "REJECTED");
+});
+
 app.post("/api/tasks", auth, async (req, res) => {
   const {
     title,
@@ -1009,7 +1416,11 @@ app.post("/api/tasks", auth, async (req, res) => {
     featured
   } = req.body;
 
-  const amount = Number(reward);
+  const workerCapacityInput =
+    req.body.worker_capacity ?? req.body.workerCapacity ?? 1;
+  const workerCapacity = parseWorkerCapacity(workerCapacityInput);
+  const amountMinorUnits = parseMoneyToMinorUnits(reward);
+  const amount = amountMinorUnits === null ? null : formatMinorUnits(amountMinorUnits);
   const taskCurrency = String(currency).trim().toUpperCase();
     const supportedCurrencies = new Set([
     "KES",
@@ -1026,8 +1437,9 @@ app.post("/api/tasks", auth, async (req, res) => {
     !title ||
     !description ||
     !category ||
-    !Number.isFinite(amount) ||
-    amount <= 0 ||
+    amountMinorUnits === null ||
+    amountMinorUnits <= 0 ||
+    workerCapacity === null ||
     !supportedCurrencies.has(taskCurrency)
   ) {
     return res.status(400).json({
@@ -1036,8 +1448,8 @@ app.post("/api/tasks", auth, async (req, res) => {
   }
 
   if (
-    (taskCurrency === "KES" && amount < 50) ||
-    (taskCurrency !== "KES" && amount < 1)
+    (taskCurrency === "KES" && amountMinorUnits < 5000) ||
+    (taskCurrency !== "KES" && amountMinorUnits < 100)
   ) {
     return res.status(400).json({
       error: "Minimum reward is 50 KES or 1 unit of other currencies"
@@ -1062,8 +1474,8 @@ app.post("/api/tasks", auth, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO tasks
        (owner_id, title, description, category,
-        reward, featured, country_code, currency)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        reward, featured, country_code, currency, worker_capacity)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
       [
         req.user.id,
@@ -1073,7 +1485,8 @@ app.post("/api/tasks", auth, async (req, res) => {
         amount,
         featured ? 1 : 0,
         countryCode,
-        taskCurrency
+        taskCurrency,
+        workerCapacity
       ]
     );
 
@@ -1116,6 +1529,13 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
       });
     }
 
+    if (Number(task.worker_capacity || 1) > 1) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "This task requires poster selection from submitted applications. Apply for the task and wait for the poster to review your application."
+      });
+    }
+
     if (Number(task.owner_id) === Number(req.user.id)) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -1123,11 +1543,15 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
       });
     }
 
-    const fee = Math.round(
-      Number(task.reward) * feePct / 100
-    );
-
-    const provider = Number(task.reward) - fee;
+    const rewardMinorUnits = parseMoneyToMinorUnits(String(task.reward));
+    if (rewardMinorUnits === null) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: "Task reward has an invalid stored amount" });
+    }
+    const feeMinorUnits = calculateFeeMinorUnits(rewardMinorUnits, feePct);
+    const providerMinorUnits = rewardMinorUnits - feeMinorUnits;
+    const fee = formatMinorUnits(feeMinorUnits);
+    const provider = formatMinorUnits(providerMinorUnits);
 
     await client.query(
       `UPDATE tasks
@@ -1145,7 +1569,7 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
         task.id,
         task.owner_id,
         req.user.id,
-        task.reward,
+        formatMinorUnits(rewardMinorUnits),
         fee,
         provider
       ]
@@ -1159,7 +1583,7 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
     res.json({
       transaction_id: transactionId,
       task_id: task.id,
-      gross_amount: task.reward,
+      gross_amount: formatMinorUnits(rewardMinorUnits),
       platform_fee: fee,
       provider_amount: provider,
       status: "PAYMENT_PENDING"
@@ -1400,6 +1824,113 @@ app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
  * M-Pesa Daraja STK Push
  */
 
+app.get("/api/wallet", auth, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO wallets(user_id, currency)
+       VALUES($1, 'KES')
+       ON CONFLICT(user_id, currency) DO NOTHING`,
+      [req.user.id]
+    );
+
+    const walletsResult = await pool.query(
+      `SELECT id, currency, balance, created_at, updated_at
+       FROM wallets WHERE user_id=$1 ORDER BY currency`,
+      [req.user.id]
+    );
+    const transactionsResult = await pool.query(
+      `SELECT wt.id, wt.transaction_type, wt.amount, wt.status,
+              wt.provider, wt.provider_receipt, wt.description,
+              wt.created_at, wt.completed_at, w.currency
+       FROM wallet_transactions wt
+       JOIN wallets w ON w.id=wt.wallet_id
+       WHERE w.user_id=$1
+       ORDER BY wt.created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    return res.json({ wallets: walletsResult.rows, transactions: transactionsResult.rows });
+  } catch (e) {
+    console.error("Wallet load error:", e);
+    return res.status(500).json({ error: "Unable to load your wallet" });
+  }
+});
+
+app.post("/api/wallet/deposits/mpesa", auth, async (req, res) => {
+  let walletTransactionId = null;
+  try {
+    const currency = String(req.body.currency || "KES").trim().toUpperCase();
+    const amountMinorUnits = parseMoneyToMinorUnits(req.body.amount);
+    if (currency !== "KES") {
+      return res.status(400).json({ error: "M-PESA wallet deposits are only available in KES" });
+    }
+    if (amountMinorUnits === null || amountMinorUnits < 100 || amountMinorUnits % 100 !== 0) {
+      return res.status(400).json({ error: "Enter a whole-number KES deposit of at least KSh 1" });
+    }
+
+    const phone = normalizeKenyanPhone(req.body.phone);
+    const amount = amountMinorUnits / 100;
+
+    await pool.query(
+      `INSERT INTO wallets(user_id, currency)
+       VALUES($1, 'KES')
+       ON CONFLICT(user_id, currency) DO NOTHING`,
+      [req.user.id]
+    );
+    const walletResult = await pool.query(
+      "SELECT id FROM wallets WHERE user_id=$1 AND currency='KES'",
+      [req.user.id]
+    );
+    const ledgerResult = await pool.query(
+      `INSERT INTO wallet_transactions
+       (wallet_id, transaction_type, amount, status, provider, payment_phone, description)
+       VALUES($1, 'DEPOSIT', $2, 'PENDING', 'MPESA', $3, 'M-PESA wallet deposit')
+       RETURNING id`,
+      [walletResult.rows[0].id, formatMinorUnits(amountMinorUnits), phone]
+    );
+    walletTransactionId = ledgerResult.rows[0].id;
+
+    const stk = await stkPush({
+      phone,
+      amount,
+      accountReference: `MMW${walletTransactionId}`,
+      transactionDesc: "MikroMate wallet"
+    });
+    const checkoutRequestId = stk.CheckoutRequestID;
+    if (String(stk.ResponseCode) !== "0" || !checkoutRequestId) {
+      await pool.query(
+        "UPDATE wallet_transactions SET status='FAILED' WHERE id=$1 AND status='PENDING'",
+        [walletTransactionId]
+      );
+      return res.status(502).json({
+        error: stk.ResponseDescription || "Safaricom did not accept the M-PESA request"
+      });
+    }
+
+    await pool.query(
+      `UPDATE wallet_transactions
+       SET checkout_request_id=$1, merchant_request_id=$2, provider_reference=$1
+       WHERE id=$3`,
+      [checkoutRequestId, stk.MerchantRequestID || null, walletTransactionId]
+    );
+    return res.status(202).json({
+      ok: true,
+      transaction_id: walletTransactionId,
+      status: "PENDING",
+      checkout_request_id: checkoutRequestId,
+      customer_message: stk.CustomerMessage || "Check your phone and enter your M-PESA PIN to complete the deposit."
+    });
+  } catch (e) {
+    if (walletTransactionId !== null) {
+      await pool.query(
+        "UPDATE wallet_transactions SET status='FAILED' WHERE id=$1 AND status='PENDING'",
+        [walletTransactionId]
+      ).catch((updateError) => console.error("Wallet deposit failure update error:", updateError.message));
+    }
+    console.error("M-PESA wallet deposit initiation error:", e);
+    return res.status(400).json({ error: e.message || "Unable to initiate M-PESA wallet deposit" });
+  }
+});
+
 app.post("/api/payments/mpesa/initiate", auth, async (req, res) => {
   try {
     const { phone, amount, taskId, currency = "KES" } = req.body;
@@ -1412,9 +1943,11 @@ if (paymentCurrency !== "KES") {
   });
 }
 
-    const paymentAmount = Number(amount);
+    const paymentMinorUnits = parseMoneyToMinorUnits(amount);
+    const paymentAmount = paymentMinorUnits === null ? null : paymentMinorUnits / 100;
 
-    if (!phone || !Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+    if (!phone || paymentAmount === null || paymentAmount <= 0 ||
+        !Number.isSafeInteger(paymentAmount)) {
       return res.status(400).json({
         error: "Phone and valid amount are required"
       });
@@ -1438,11 +1971,9 @@ if (paymentCurrency !== "KES") {
       [
         taskId || 0,
         req.user.id,
-        Math.round(paymentAmount),
-        Math.round(paymentAmount * feePct / 100),
-        Math.round(
-          paymentAmount - (paymentAmount * feePct / 100)
-        ),
+        formatMinorUnits(paymentMinorUnits),
+        formatMinorUnits(calculateFeeMinorUnits(paymentMinorUnits, feePct)),
+        formatMinorUnits(paymentMinorUnits - calculateFeeMinorUnits(paymentMinorUnits, feePct)),
         paymentCurrency,
         phone.trim()
       ]
@@ -1491,58 +2022,139 @@ if (paymentCurrency !== "KES") {
 
 
 app.post("/api/payments/mpesa/callback", async (req, res) => {
+  const acknowledge = () => res.json({ ResultCode: 0, ResultDesc: "Accepted" });
+  let client;
+  let inTransaction = false;
   try {
-    console.log(
-      "M-Pesa callback received:",
-      JSON.stringify(req.body)
-    );
-
     const callback = req.body?.Body?.stkCallback;
-
-    if (!callback) {
-      return res.json({
-        ResultCode: 0,
-        ResultDesc: "Accepted"
-      });
-    }
-
-    const checkoutRequestId = callback.CheckoutRequestID;
+    if (!callback?.CheckoutRequestID) return acknowledge();
+    const checkoutRequestId = String(callback.CheckoutRequestID);
     const resultCode = Number(callback.ResultCode);
 
-    if (checkoutRequestId) {
-      const status =
-        resultCode === 0
-          ? "PAID"
-          : "PAYMENT_FAILED";
-
+    if (resultCode !== 0) {
       await pool.query(
-        `UPDATE transactions
-         SET status=$1
-         WHERE external_reference=$2`,
-        [status, checkoutRequestId]
+        `UPDATE wallet_transactions SET status='FAILED'
+         WHERE checkout_request_id=$1 AND status='PENDING'`,
+        [checkoutRequestId]
       );
+      await pool.query(
+        `UPDATE transactions SET status='PAYMENT_FAILED'
+         WHERE external_reference=$1 AND status='PAYMENT_PENDING'`,
+        [checkoutRequestId]
+      );
+      return acknowledge();
     }
 
-    res.json({
-      ResultCode: 0,
-      ResultDesc: "Accepted"
-    });
+    const items = callback.CallbackMetadata?.Item;
+    if (!Array.isArray(items)) return acknowledge();
+    const metadata = {};
+    for (const item of items) {
+      if (item && typeof item.Name === "string") metadata[item.Name] = item.Value;
+    }
+    const callbackAmountMinor = parseMoneyToMinorUnits(String(metadata.Amount ?? ""));
+    const receipt = String(metadata.MpesaReceiptNumber ?? "").trim();
+    if (callbackAmountMinor === null || callbackAmountMinor <= 0 || !receipt || metadata.PhoneNumber === undefined) {
+      console.error("M-PESA callback missing valid amount, receipt, or phone", checkoutRequestId);
+      return acknowledge();
+    }
 
+    const queryResult = await queryStkPush({ checkoutRequestId });
+    if (String(queryResult.ResultCode) !== "0" ||
+        String(queryResult.CheckoutRequestID) !== checkoutRequestId) {
+      console.warn("Daraja STK query has not confirmed payment", checkoutRequestId, queryResult.ResultDesc);
+      return acknowledge();
+    }
+
+    const normalizedCallbackPhone = normalizeKenyanPhone(String(metadata.PhoneNumber));
+    client = await pool.connect();
+    await client.query("BEGIN");
+    inTransaction = true;
+
+    const walletResult = await client.query(
+      `SELECT wt.id, wt.wallet_id, wt.amount, wt.status, wt.payment_phone
+       FROM wallet_transactions wt
+       JOIN wallets w ON w.id=wt.wallet_id
+       WHERE wt.checkout_request_id=$1 AND wt.provider='MPESA'
+       FOR UPDATE OF wt, w`,
+      [checkoutRequestId]
+    );
+
+    if (walletResult.rows.length > 0) {
+      const deposit = walletResult.rows[0];
+      const expectedAmountMinor = parseMoneyToMinorUnits(String(deposit.amount));
+      const expectedPhone = normalizeKenyanPhone(deposit.payment_phone);
+      if (expectedAmountMinor !== callbackAmountMinor || expectedPhone !== normalizedCallbackPhone) {
+        await client.query("ROLLBACK");
+        inTransaction = false;
+        console.error("M-PESA wallet callback metadata mismatch", checkoutRequestId);
+        return acknowledge();
+      }
+      if (deposit.status === "COMPLETED") {
+        await client.query("COMMIT");
+        inTransaction = false;
+        return acknowledge();
+      }
+
+      const completed = await client.query(
+        `UPDATE wallet_transactions
+         SET status='COMPLETED', provider_receipt=$1, transaction_date=$2,
+             completed_at=CURRENT_TIMESTAMP
+         WHERE id=$3 AND status='PENDING'
+         RETURNING id`,
+        [receipt, metadata.TransactionDate ? String(metadata.TransactionDate) : null, deposit.id]
+      );
+      if (completed.rows.length > 0) {
+        await client.query(
+          `UPDATE wallets SET balance=balance + $1::numeric,
+             updated_at=CURRENT_TIMESTAMP WHERE id=$2`,
+          [String(deposit.amount), deposit.wallet_id]
+        );
+      }
+      await client.query("COMMIT");
+      inTransaction = false;
+      return acknowledge();
+    }
+
+    // Task payments are recorded separately; they never credit a wallet.
+    const taskPaymentResult = await client.query(
+      `SELECT id, gross_amount, payment_phone, status
+       FROM transactions WHERE external_reference=$1 FOR UPDATE`,
+      [checkoutRequestId]
+    );
+    if (taskPaymentResult.rows.length > 0) {
+      const payment = taskPaymentResult.rows[0];
+      const expectedAmountMinor = parseMoneyToMinorUnits(String(payment.gross_amount));
+      const expectedPhone = normalizeKenyanPhone(payment.payment_phone);
+      if (expectedAmountMinor !== callbackAmountMinor || expectedPhone !== normalizedCallbackPhone) {
+        await client.query("ROLLBACK");
+        inTransaction = false;
+        console.error("M-PESA task payment callback metadata mismatch", checkoutRequestId);
+        return acknowledge();
+      }
+      if (payment.status !== "PAID") {
+        await client.query(
+          `UPDATE transactions SET status='PAID', provider_receipt=$1
+           WHERE id=$2 AND status='PAYMENT_PENDING'`,
+          [receipt, payment.id]
+        );
+      }
+    }
+    await client.query("COMMIT");
+    inTransaction = false;
+    return acknowledge();
   } catch (e) {
-    console.error("M-Pesa callback error:", e);
-
-    res.json({
-      ResultCode: 0,
-      ResultDesc: "Accepted"
-    });
+    if (client && inTransaction) {
+      try { await client.query("ROLLBACK"); }
+      catch (rollbackError) { console.error("M-PESA callback rollback failed:", rollbackError.message); }
+    }
+    console.error("M-PESA callback processing error:", e);
+    return acknowledge();
+  } finally {
+    if (client) client.release();
   }
 });
 app.get("/", (req, res) => {
   res.sendFile(path.join(rootDir, "index.html"));
-});
-
-app.get("/admin", (req, res) => {
-  res.sendFile(path.join(rootDir, "admin.html"));
 });
 async function startServer() {
   // Start HTTP server immediately so Render can detect the port.
