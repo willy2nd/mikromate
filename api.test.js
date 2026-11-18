@@ -139,11 +139,11 @@ test("fee rounding remains precise for large valid amounts", () => {
 
 
 test("wallet API keeps deposits separate and verifies callback details before credit", () => {
-  assert.match(serverSource, /app\\.get\\("\\/api\\/wallet", auth/);
-  assert.match(serverSource, /app\\.post\\("\\/api\\/wallet\\/deposits\\/mpesa", auth/);
-  assert.match(serverSource, /queryStkPush\\(\\{ checkoutRequestId \\}\\)/);
+  assert.match(serverSource, /app\.get\("\/api\/wallet", auth/);
+  assert.match(serverSource, /app\.post\("\/api\/wallet\/deposits\/mpesa", auth/);
+  assert.match(serverSource, /queryStkPush\(\{ checkoutRequestId \}\)/);
   assert.match(serverSource, /expectedAmountMinor !== callbackAmountMinor/);
   assert.match(serverSource, /expectedPhone !== normalizedCallbackPhone/);
-  assert.match(serverSource, /SET balance=balance \\+ \\$1::numeric/);
+  assert.match(serverSource, /SET balance=balance \+ \$1::numeric/);
   assert.match(serverSource, /idx_wallet_transactions_provider_receipt/);
 });
