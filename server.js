@@ -247,7 +247,7 @@ async function initDatabase() {
     ON wallet_transactions(checkout_request_id)
     WHERE checkout_request_id IS NOT NULL;
 
-    DO $
+    DO $wallet_receipt_guard$
     BEGIN
       IF EXISTS (
         SELECT provider_receipt FROM wallet_transactions
@@ -257,7 +257,7 @@ async function initDatabase() {
         RAISE EXCEPTION 'Duplicate wallet M-PESA receipts exist; resolve them before enabling receipt uniqueness.';
       END IF;
     END
-    $;
+    $wallet_receipt_guard$;
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_transactions_provider_receipt
     ON wallet_transactions(provider_receipt)
