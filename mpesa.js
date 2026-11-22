@@ -128,3 +128,42 @@ export async function stkPush({
 
   return j;
 }
+
+export async function queryStkPush({ checkoutRequestId }) {
+  const checkoutId = String(checkoutRequestId ?? "").trim();
+  if (!checkoutId) throw new Error("CheckoutRequestID is required");
+  const token = await getAccessToken();
+  const shortcode = process.env.MPESA_SHORTCODE;
+  const passkey = process.env.MPESA_PASSKEY;
+  if (!shortcode || !passkey) throw new Error("Daraja shortcode/passkey missing");
+
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Africa/Nairobi",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).formatToParts(new Date()).reduce((acc, part) => {
+    if (part.type !== "literal") acc[part.type] = part.value;
+    return acc;
+  }, {});
+  const timestamp = `${parts.year}${parts.month}${parts.day}${parts.hour}${parts.minute}${parts.second}`;
+  const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString("base64");
+
+  const response = await fetch(`${BASE}/mpesa/stkpushquery/v1/query`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      BusinessShortCode: shortcode,
+      Password: password,
+      Timestamp: timestamp,
+      CheckoutRequestID: checkoutId
+    })
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.errorMessage || `STK query failed ${response.status}`);
+  return result;
+}
