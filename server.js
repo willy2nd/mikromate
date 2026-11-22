@@ -413,14 +413,31 @@ if (existingAdmin.rows.length > 0) {
 });
 app.get("/api/health", async (req, res) => {
   try {
-    await pool.query("SELECT 1");
-    res.json({
-      ok: true,
+    const result = await pool.query(`
+      SELECT
+        1 AS connected,
+        to_regclass('public.wallets') IS NOT NULL AS wallets_table,
+        to_regclass('public.wallet_transactions') IS NOT NULL AS wallet_transactions_table,
+        COALESCE(
+          (SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()),
+          false
+        ) AS tls_in_use
+    `);
+    const db = result.rows[0];
+    const walletSchemaReady = Boolean(db.wallets_table && db.wallet_transactions_table);
+    res.status(walletSchemaReady ? 200 : 503).json({
+      ok: walletSchemaReady,
       version: "5.0.0",
-      database: "postgresql"
+      database: "postgresql",
+      walletSchema: walletSchemaReady ? "ready" : "missing_tables",
+      tls: db.tls_in_use ? "enabled" : "not_confirmed"
     });
   } catch (e) {
-    console.error("Database health check failed:", e);
+    console.error("Database health check failed:", {
+      code: e.code || "UNKNOWN",
+      name: e.name || "DatabaseError",
+      message: e.message
+    });
     res.status(503).json({
       ok: false,
       database: "unavailable"
@@ -2147,13 +2164,39 @@ async function startServer() {
     console.log(`MikroMate API listening on ${port}`);
   });
 
+  const startedAt = Date.now();
   try {
     await initDatabase();
-    await pool.query("SELECT 1");
-
-    console.log("MikroMate PostgreSQL database connected");
+    const diagnostic = await pool.query(`
+      SELECT
+        current_database() AS database_name,
+        inet_server_addr()::text AS server_address,
+        COALESCE(
+          (SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()),
+          false
+        ) AS tls_in_use,
+        to_regclass('public.wallets') IS NOT NULL AS wallets_table,
+        to_regclass('public.wallet_transactions') IS NOT NULL AS wallet_transactions_table
+    `);
+    const db = diagnostic.rows[0];
+    console.log("MikroMate PostgreSQL connection diagnostic:", {
+      connected: true,
+      database: db.database_name,
+      serverAddressResolved: Boolean(db.server_address),
+      tlsInUse: db.tls_in_use,
+      walletTablesReady: Boolean(db.wallets_table && db.wallet_transactions_table),
+      elapsedMs: Date.now() - startedAt
+    });
+    if (!db.wallets_table || !db.wallet_transactions_table) {
+      console.error("Wallet database schema is incomplete; wallet operations must remain disabled.");
+    }
   } catch (e) {
-    console.error("PostgreSQL connection failed:", e);
+    console.error("PostgreSQL connection or migration diagnostic failed:", {
+      code: e.code || "UNKNOWN",
+      name: e.name || "DatabaseError",
+      message: e.message,
+      elapsedMs: Date.now() - startedAt
+    });
   }
 }
 
