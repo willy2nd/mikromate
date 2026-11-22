@@ -240,7 +240,7 @@ async function initDatabase() {
       ) THEN
         RAISE EXCEPTION 'Duplicate wallet M-PESA receipts exist; resolve them before enabling receipt uniqueness.';
       END IF;
-    END
+    END;
     $wallet_receipt_guard$;
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_transactions_provider_receipt
@@ -281,8 +281,8 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'Cannot create unique M-PESA receipt index: duplicate provider_receipt values exist. Resolve duplicates before retrying migration.';
   END IF;
-END
-$$;
+END;
+$;
 
 -- Prevent duplicate M-PESA receipts
 CREATE UNIQUE INDEX IF NOT EXISTS
