@@ -282,7 +282,7 @@ BEGIN
     RAISE EXCEPTION 'Cannot create unique M-PESA receipt index: duplicate provider_receipt values exist. Resolve duplicates before retrying migration.';
   END IF;
 END;
-$;
+$$;
 
 -- Prevent duplicate M-PESA receipts
 CREATE UNIQUE INDEX IF NOT EXISTS
