@@ -6,6 +6,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
 import { lookup } from "node:dns/promises";
+import { createConnection } from "node:net";
 
 import { randomBytes, createHash } from "crypto";
 import path from "path";
@@ -2175,12 +2176,63 @@ app.post("/api/payments/mpesa/callback", async (req, res) => {
 app.get("/", (req, res) => {
   res.sendFile(path.join(rootDir, "index.html"));
 });
+async function diagnosePostgresTcp() {
+  const startedAt = Date.now();
+  let dbUrl;
+  try {
+    dbUrl = new URL(process.env.DATABASE_URL);
+  } catch (error) {
+    console.error("MikroMate PostgreSQL TCP-only diagnostic:", {
+      result: "invalid_database_url",
+      message: "DATABASE_URL could not be parsed; value was not logged."
+    });
+    return false;
+  }
+
+  const host = dbUrl.hostname;
+  const port = Number(dbUrl.port || 5432);
+  console.log("MikroMate PostgreSQL TCP-only diagnostic: starting", {
+    host,
+    port,
+    timeoutMs: 7000
+  });
+
+  return await new Promise((resolve) => {
+    let finished = false;
+    const socket = createConnection({ host, port });
+    const finish = (result, error = null) => {
+      if (finished) return;
+      finished = true;
+      console.log("MikroMate PostgreSQL TCP-only diagnostic:", {
+        result,
+        host,
+        port,
+        elapsedMs: Date.now() - startedAt,
+        ...(error ? {
+          errorCode: error.code || "UNKNOWN",
+          errorName: error.name || "Error",
+          errorMessage: error.message
+        } : {})
+      });
+      socket.destroy();
+      resolve(result === "connected");
+    };
+
+    socket.setTimeout(7000);
+    socket.once("connect", () => finish("connected"));
+    socket.once("timeout", () => finish("timeout"));
+    socket.once("error", (error) => finish("error", error));
+  });
+}
+
 async function startServer() {
   // Start HTTP server immediately so Render can detect the port.
  
   app.listen(port, "0.0.0.0", () => {
     console.log(`MikroMate API listening on ${port}`);
   });
+
+  await diagnosePostgresTcp();
 
   const startedAt = Date.now();
   try {
