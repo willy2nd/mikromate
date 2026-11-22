@@ -10,7 +10,7 @@ import { lookup } from "node:dns/promises";
 import { randomBytes, createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getAccessToken, stkPush } from "./mpesa.js";
+import { getAccessToken, stkPush, normalizeKenyanPhone, queryStkPush } from "./mpesa.js";
 import { parseWorkerCapacity, getRemainingWorkerSlots } from "./worker-capacity.js";
 import { parseMoneyToMinorUnits, formatMinorUnits, calculateFeeMinorUnits } from "./money.js";
 const { Pool } = pg;
@@ -219,6 +219,33 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_wallet_transactions_wallet_id
     ON wallet_transactions(wallet_id);
+
+    -- M-PESA deposit reconciliation metadata for wallet ledger entries.
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS payment_phone TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS checkout_request_id TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS merchant_request_id TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS provider_receipt TEXT;
+    ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS transaction_date TEXT;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_transactions_checkout_request_id
+    ON wallet_transactions(checkout_request_id)
+    WHERE checkout_request_id IS NOT NULL;
+
+    DO $wallet_receipt_guard$
+    BEGIN
+      IF EXISTS (
+        SELECT provider_receipt FROM wallet_transactions
+        WHERE provider_receipt IS NOT NULL
+        GROUP BY provider_receipt HAVING COUNT(*) > 1
+      ) THEN
+        RAISE EXCEPTION 'Duplicate wallet M-PESA receipts exist; resolve them before enabling receipt uniqueness.';
+      END IF;
+    END
+    $wallet_receipt_guard$;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_transactions_provider_receipt
+    ON wallet_transactions(provider_receipt)
+    WHERE provider_receipt IS NOT NULL;
 
     -- International country support
 ALTER TABLE users
@@ -1781,6 +1808,113 @@ app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
  * M-Pesa Daraja STK Push
  */
 
+app.get("/api/wallet", auth, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO wallets(user_id, currency)
+       VALUES($1, 'KES')
+       ON CONFLICT(user_id, currency) DO NOTHING`,
+      [req.user.id]
+    );
+
+    const walletsResult = await pool.query(
+      `SELECT id, currency, balance, created_at, updated_at
+       FROM wallets WHERE user_id=$1 ORDER BY currency`,
+      [req.user.id]
+    );
+    const transactionsResult = await pool.query(
+      `SELECT wt.id, wt.transaction_type, wt.amount, wt.status,
+              wt.provider, wt.provider_receipt, wt.description,
+              wt.created_at, wt.completed_at, w.currency
+       FROM wallet_transactions wt
+       JOIN wallets w ON w.id=wt.wallet_id
+       WHERE w.user_id=$1
+       ORDER BY wt.created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    return res.json({ wallets: walletsResult.rows, transactions: transactionsResult.rows });
+  } catch (e) {
+    console.error("Wallet load error:", e);
+    return res.status(500).json({ error: "Unable to load your wallet" });
+  }
+});
+
+app.post("/api/wallet/deposits/mpesa", auth, async (req, res) => {
+  let walletTransactionId = null;
+  try {
+    const currency = String(req.body.currency || "KES").trim().toUpperCase();
+    const amountMinorUnits = parseMoneyToMinorUnits(req.body.amount);
+    if (currency !== "KES") {
+      return res.status(400).json({ error: "M-PESA wallet deposits are only available in KES" });
+    }
+    if (amountMinorUnits === null || amountMinorUnits < 100 || amountMinorUnits % 100 !== 0) {
+      return res.status(400).json({ error: "Enter a whole-number KES deposit of at least KSh 1" });
+    }
+
+    const phone = normalizeKenyanPhone(req.body.phone);
+    const amount = amountMinorUnits / 100;
+
+    await pool.query(
+      `INSERT INTO wallets(user_id, currency)
+       VALUES($1, 'KES')
+       ON CONFLICT(user_id, currency) DO NOTHING`,
+      [req.user.id]
+    );
+    const walletResult = await pool.query(
+      "SELECT id FROM wallets WHERE user_id=$1 AND currency='KES'",
+      [req.user.id]
+    );
+    const ledgerResult = await pool.query(
+      `INSERT INTO wallet_transactions
+       (wallet_id, transaction_type, amount, status, provider, payment_phone, description)
+       VALUES($1, 'DEPOSIT', $2, 'PENDING', 'MPESA', $3, 'M-PESA wallet deposit')
+       RETURNING id`,
+      [walletResult.rows[0].id, formatMinorUnits(amountMinorUnits), phone]
+    );
+    walletTransactionId = ledgerResult.rows[0].id;
+
+    const stk = await stkPush({
+      phone,
+      amount,
+      accountReference: `MMW${walletTransactionId}`,
+      transactionDesc: "MikroMate wallet"
+    });
+    const checkoutRequestId = stk.CheckoutRequestID;
+    if (String(stk.ResponseCode) !== "0" || !checkoutRequestId) {
+      await pool.query(
+        "UPDATE wallet_transactions SET status='FAILED' WHERE id=$1 AND status='PENDING'",
+        [walletTransactionId]
+      );
+      return res.status(502).json({
+        error: stk.ResponseDescription || "Safaricom did not accept the M-PESA request"
+      });
+    }
+
+    await pool.query(
+      `UPDATE wallet_transactions
+       SET checkout_request_id=$1, merchant_request_id=$2, provider_reference=$1
+       WHERE id=$3`,
+      [checkoutRequestId, stk.MerchantRequestID || null, walletTransactionId]
+    );
+    return res.status(202).json({
+      ok: true,
+      transaction_id: walletTransactionId,
+      status: "PENDING",
+      checkout_request_id: checkoutRequestId,
+      customer_message: stk.CustomerMessage || "Check your phone and enter your M-PESA PIN to complete the deposit."
+    });
+  } catch (e) {
+    if (walletTransactionId !== null) {
+      await pool.query(
+        "UPDATE wallet_transactions SET status='FAILED' WHERE id=$1 AND status='PENDING'",
+        [walletTransactionId]
+      ).catch((updateError) => console.error("Wallet deposit failure update error:", updateError.message));
+    }
+    console.error("M-PESA wallet deposit initiation error:", e);
+    return res.status(400).json({ error: e.message || "Unable to initiate M-PESA wallet deposit" });
+  }
+});
+
 app.post("/api/payments/mpesa/initiate", auth, async (req, res) => {
   try {
     const { phone, amount, taskId, currency = "KES" } = req.body;
@@ -1872,50 +2006,135 @@ if (paymentCurrency !== "KES") {
 
 
 app.post("/api/payments/mpesa/callback", async (req, res) => {
+  const acknowledge = () => res.json({ ResultCode: 0, ResultDesc: "Accepted" });
+  let client;
+  let inTransaction = false;
   try {
-    console.log(
-      "M-Pesa callback received:",
-      JSON.stringify(req.body)
-    );
-
     const callback = req.body?.Body?.stkCallback;
-
-    if (!callback) {
-      return res.json({
-        ResultCode: 0,
-        ResultDesc: "Accepted"
-      });
-    }
-
-    const checkoutRequestId = callback.CheckoutRequestID;
+    if (!callback?.CheckoutRequestID) return acknowledge();
+    const checkoutRequestId = String(callback.CheckoutRequestID);
     const resultCode = Number(callback.ResultCode);
 
-    if (checkoutRequestId) {
-      const status =
-        resultCode === 0
-          ? "PAID"
-          : "PAYMENT_FAILED";
-
+    if (resultCode !== 0) {
       await pool.query(
-        `UPDATE transactions
-         SET status=$1
-         WHERE external_reference=$2`,
-        [status, checkoutRequestId]
+        `UPDATE wallet_transactions SET status='FAILED'
+         WHERE checkout_request_id=$1 AND status='PENDING'`,
+        [checkoutRequestId]
       );
+      await pool.query(
+        `UPDATE transactions SET status='PAYMENT_FAILED'
+         WHERE external_reference=$1 AND status='PAYMENT_PENDING'`,
+        [checkoutRequestId]
+      );
+      return acknowledge();
     }
 
-    res.json({
-      ResultCode: 0,
-      ResultDesc: "Accepted"
-    });
+    const items = callback.CallbackMetadata?.Item;
+    if (!Array.isArray(items)) return acknowledge();
+    const metadata = {};
+    for (const item of items) {
+      if (item && typeof item.Name === "string") metadata[item.Name] = item.Value;
+    }
+    const callbackAmountMinor = parseMoneyToMinorUnits(String(metadata.Amount ?? ""));
+    const receipt = String(metadata.MpesaReceiptNumber ?? "").trim();
+    if (callbackAmountMinor === null || callbackAmountMinor <= 0 || !receipt || metadata.PhoneNumber === undefined) {
+      console.error("M-PESA callback missing valid amount, receipt, or phone", checkoutRequestId);
+      return acknowledge();
+    }
 
+    const queryResult = await queryStkPush({ checkoutRequestId });
+    if (String(queryResult.ResultCode) !== "0" ||
+        String(queryResult.CheckoutRequestID) !== checkoutRequestId) {
+      console.warn("Daraja STK query has not confirmed payment", checkoutRequestId, queryResult.ResultDesc);
+      return acknowledge();
+    }
+
+    const normalizedCallbackPhone = normalizeKenyanPhone(String(metadata.PhoneNumber));
+    client = await pool.connect();
+    await client.query("BEGIN");
+    inTransaction = true;
+
+    const walletResult = await client.query(
+      `SELECT wt.id, wt.wallet_id, wt.amount, wt.status, wt.payment_phone
+       FROM wallet_transactions wt
+       JOIN wallets w ON w.id=wt.wallet_id
+       WHERE wt.checkout_request_id=$1 AND wt.provider='MPESA'
+       FOR UPDATE OF wt, w`,
+      [checkoutRequestId]
+    );
+
+    if (walletResult.rows.length > 0) {
+      const deposit = walletResult.rows[0];
+      const expectedAmountMinor = parseMoneyToMinorUnits(String(deposit.amount));
+      const expectedPhone = normalizeKenyanPhone(deposit.payment_phone);
+      if (expectedAmountMinor !== callbackAmountMinor || expectedPhone !== normalizedCallbackPhone) {
+        await client.query("ROLLBACK");
+        inTransaction = false;
+        console.error("M-PESA wallet callback metadata mismatch", checkoutRequestId);
+        return acknowledge();
+      }
+      if (deposit.status === "COMPLETED") {
+        await client.query("COMMIT");
+        inTransaction = false;
+        return acknowledge();
+      }
+
+      const completed = await client.query(
+        `UPDATE wallet_transactions
+         SET status='COMPLETED', provider_receipt=$1, transaction_date=$2,
+             completed_at=CURRENT_TIMESTAMP
+         WHERE id=$3 AND status='PENDING'
+         RETURNING id`,
+        [receipt, metadata.TransactionDate ? String(metadata.TransactionDate) : null, deposit.id]
+      );
+      if (completed.rows.length > 0) {
+        await client.query(
+          `UPDATE wallets SET balance=balance + $1::numeric,
+             updated_at=CURRENT_TIMESTAMP WHERE id=$2`,
+          [String(deposit.amount), deposit.wallet_id]
+        );
+      }
+      await client.query("COMMIT");
+      inTransaction = false;
+      return acknowledge();
+    }
+
+    // Task payments are recorded separately; they never credit a wallet.
+    const taskPaymentResult = await client.query(
+      `SELECT id, gross_amount, payment_phone, status
+       FROM transactions WHERE external_reference=$1 FOR UPDATE`,
+      [checkoutRequestId]
+    );
+    if (taskPaymentResult.rows.length > 0) {
+      const payment = taskPaymentResult.rows[0];
+      const expectedAmountMinor = parseMoneyToMinorUnits(String(payment.gross_amount));
+      const expectedPhone = normalizeKenyanPhone(payment.payment_phone);
+      if (expectedAmountMinor !== callbackAmountMinor || expectedPhone !== normalizedCallbackPhone) {
+        await client.query("ROLLBACK");
+        inTransaction = false;
+        console.error("M-PESA task payment callback metadata mismatch", checkoutRequestId);
+        return acknowledge();
+      }
+      if (payment.status !== "PAID") {
+        await client.query(
+          `UPDATE transactions SET status='PAID', provider_receipt=$1
+           WHERE id=$2 AND status='PAYMENT_PENDING'`,
+          [receipt, payment.id]
+        );
+      }
+    }
+    await client.query("COMMIT");
+    inTransaction = false;
+    return acknowledge();
   } catch (e) {
-    console.error("M-Pesa callback error:", e);
-
-    res.json({
-      ResultCode: 0,
-      ResultDesc: "Accepted"
-    });
+    if (client && inTransaction) {
+      try { await client.query("ROLLBACK"); }
+      catch (rollbackError) { console.error("M-PESA callback rollback failed:", rollbackError.message); }
+    }
+    console.error("M-PESA callback processing error:", e);
+    return acknowledge();
+  } finally {
+    if (client) client.release();
   }
 });
 app.get("/", (req, res) => {
