@@ -55,7 +55,20 @@ const pool = new Pool({
   ssl:
     process.env.DATABASE_SSL === "true"
       ? { rejectUnauthorized: false }
-      : undefined
+      : undefined,
+  // Fail quickly with a useful error instead of hanging during startup.
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  keepAlive: true,
+  application_name: "mikromate-staging"
+});
+
+pool.on("error", (error) => {
+  console.error("PostgreSQL pool background error:", {
+    code: error.code || "UNKNOWN",
+    name: error.name || "DatabaseError",
+    message: error.message
+  });
 });
 
 app.use(helmet());
@@ -79,7 +92,12 @@ const resetPasswordLimiter = rateLimit({
 });
 
 async function initDatabase() {
+  console.log("PostgreSQL initialization: requesting database connection", {
+    connectionTimeoutMs: 10000,
+    sslEnabled: process.env.DATABASE_SSL === "true"
+  });
   const client = await pool.connect();
+  console.log("PostgreSQL initialization: database connection acquired");
   let transactionStarted = false;
   try {
     await client.query("BEGIN");
