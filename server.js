@@ -1542,7 +1542,8 @@ app.post("/api/wallet/withdrawals", auth, async (req, res) => {
     "MPESA_B2C_SECURITY_CREDENTIAL",
     "MPESA_B2C_SHORTCODE",
     "MPESA_B2C_RESULT_URL",
-    "MPESA_B2C_TIMEOUT_URL"
+    "MPESA_B2C_TIMEOUT_URL",
+    "MPESA_B2C_CALLBACK_TOKEN"
   ];
   const missingB2C = requiredB2C.filter(name => !process.env[name]);
   if (missingB2C.length) {
@@ -1576,22 +1577,15 @@ app.post("/api/wallet/withdrawals", auth, async (req, res) => {
       return res.status(409).json({ error: "Insufficient available wallet balance" });
     }
 
+    originatorConversationId = `MMWOUT${randomBytes(12).toString("hex").toUpperCase()}`;
     const inserted = await client.query(
       `INSERT INTO wallet_withdrawals
        (user_id, wallet_id, amount, phone, originator_conversation_id)
-       VALUES ($1,$2,$3,$4,'PENDING')
+       VALUES ($1,$2,$3,$4,$5)
        RETURNING id`,
-      [req.user.id, wallet.id, amount, phone]
+      [req.user.id, wallet.id, amount, phone, originatorConversationId]
     );
     withdrawalId = inserted.rows[0].id;
-    originatorConversationId = `MMWOUT${withdrawalId}`;
-
-    await client.query(
-      `UPDATE wallet_withdrawals
-       SET originator_conversation_id=$1, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [originatorConversationId, withdrawalId]
-    );
 
     const ledger = await client.query(
       `INSERT INTO wallet_transactions
@@ -1702,6 +1696,10 @@ app.get("/api/wallet/withdrawals", auth, async (req, res) => {
 });
 
 app.post("/api/wallet/withdrawals/result", async (req, res) => {
+  if (!process.env.MPESA_B2C_CALLBACK_TOKEN ||
+      req.query.token !== process.env.MPESA_B2C_CALLBACK_TOKEN) {
+    return res.status(403).json({ ResultCode: 1, ResultDesc: "Unauthorized callback" });
+  }
   const result = req.body?.Result;
   const originatorId = String(result?.OriginatorConversationID || "").trim();
   const resultCode = Number(result?.ResultCode);
@@ -1825,6 +1823,10 @@ app.post("/api/wallet/withdrawals/result", async (req, res) => {
 });
 
 app.post("/api/wallet/withdrawals/timeout", async (req, res) => {
+  if (!process.env.MPESA_B2C_CALLBACK_TOKEN ||
+      req.query.token !== process.env.MPESA_B2C_CALLBACK_TOKEN) {
+    return res.status(403).json({ ResultCode: 1, ResultDesc: "Unauthorized callback" });
+  }
   const result = req.body?.Result;
   const originatorId = String(result?.OriginatorConversationID || "").trim();
   if (!originatorId) {
