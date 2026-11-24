@@ -48,6 +48,68 @@ export function normalizeKenyanPhone(phone) {
   );
 }
 
+export async function b2cPayment({
+  phone,
+  amount,
+  originatorConversationId,
+  remarks
+}) {
+  phone = normalizeKenyanPhone(phone);
+  const paymentAmount = Number(amount);
+  if (!Number.isSafeInteger(paymentAmount) || paymentAmount <= 0) {
+    throw new Error("Invalid M-PESA B2C amount");
+  }
+
+  const initiator = process.env.MPESA_B2C_INITIATOR_NAME;
+  const credential = process.env.MPESA_B2C_SECURITY_CREDENTIAL;
+  const shortcode = process.env.MPESA_B2C_SHORTCODE;
+  const configuredResultUrl = process.env.MPESA_B2C_RESULT_URL;
+  const configuredTimeoutUrl = process.env.MPESA_B2C_TIMEOUT_URL;
+  const callbackToken = process.env.MPESA_B2C_CALLBACK_TOKEN;
+  if (!initiator || !credential || !shortcode ||
+      !configuredResultUrl || !configuredTimeoutUrl || !callbackToken) {
+    throw new Error("Dedicated M-PESA B2C payout configuration is incomplete");
+  }
+
+  // Daraja callbacks carry a per-service secret query token; never expose it in logs.
+  const resultUrl = new URL(configuredResultUrl);
+  resultUrl.searchParams.set("token", callbackToken);
+  const timeoutUrl = new URL(configuredTimeoutUrl);
+  timeoutUrl.searchParams.set("token", callbackToken);
+
+  const token = await getAccessToken();
+  const response = await fetch(`${BASE}/mpesa/b2c/v1/paymentrequest`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      InitiatorName: initiator,
+      SecurityCredential: credential,
+      CommandID: process.env.MPESA_B2C_COMMAND_ID || "BusinessPayment",
+      Amount: paymentAmount,
+      PartyA: shortcode,
+      PartyB: phone,
+      Remarks: String(remarks || "MikroMate wallet withdrawal").slice(0,100),
+      QueueTimeOutURL: timeoutUrl,
+      ResultURL: resultUrl,
+      Occasion: String(originatorConversationId).slice(0,20)
+    })
+  });
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`Daraja B2C returned an unreadable response (HTTP ${response.status})`);
+  }
+  if (!response.ok) {
+    throw new Error(payload.errorMessage || `Daraja B2C request failed (HTTP ${response.status})`);
+  }
+  return payload;
+}
+
 export async function stkPush({
   phone,
   amount,
