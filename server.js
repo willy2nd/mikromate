@@ -10,6 +10,7 @@ import { randomBytes, createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import { getAccessToken, stkPush, normalizeKenyanPhone } from "./mpesa.js";
+import { parseWorkerCapacity, getRemainingWorkerSlots } from "./worker-capacity.js";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -97,9 +98,12 @@ async function initDatabase() {
       status TEXT NOT NULL DEFAULT 'OPEN',
       provider_id INTEGER,
       featured INTEGER NOT NULL DEFAULT 0,
+      worker_capacity INTEGER NOT NULL DEFAULT 1 CHECK(worker_capacity >= 1),
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS worker_capacity INTEGER NOT NULL DEFAULT 1 CHECK (worker_capacity >= 1);
+
     CREATE TABLE IF NOT EXISTS task_applications(
       id SERIAL PRIMARY KEY,
       task_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -899,47 +903,72 @@ app.get("/api/tasks", async (req, res) => {
 
 app.post("/api/tasks/:id/applications", auth, async (req, res) => {
   const taskId = Number(req.params.id);
-  const message = String(req.body.message || "").trim();
+  const message = String(req.body?.message || "").trim();
 
   if (!Number.isInteger(taskId) || taskId <= 0) {
-    return res.status(400).json({
-      error: "Invalid job ID"
-    });
+    return res.status(400).json({ error: "Invalid job ID" });
   }
 
   if (message.length > 1000) {
-    return res.status(400).json({
-      error: "Application message is too long"
-    });
+    return res.status(400).json({ error: "Application message is too long" });
   }
 
+  let client;
+  let transactionStarted = false;
+
   try {
-    const taskResult = await pool.query(
-      "SELECT id, owner_id, status FROM tasks WHERE id=$1",
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    // Use the same task-row lock as accept/reject decisions. This serializes
+    // capacity checks with applications and prevents stale capacity reads.
+    const taskResult = await client.query(
+      `SELECT id, owner_id, status, worker_capacity
+       FROM tasks WHERE id=$1 FOR UPDATE`,
       [taskId]
     );
-
     const task = taskResult.rows[0];
 
     if (!task) {
-      return res.status(404).json({
-        error: "Job not found"
-      });
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Job not found" });
     }
 
     if (task.status !== "OPEN") {
-      return res.status(409).json({
-        error: "This job is no longer available"
-      });
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({ error: "This job is no longer available" });
     }
 
     if (Number(task.owner_id) === Number(req.user.id)) {
-      return res.status(403).json({
-        error: "You cannot apply for your own job"
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(403).json({ error: "You cannot apply for your own job" });
+    }
+
+    const acceptedResult = await client.query(
+      `SELECT COUNT(*)::int AS accepted_workers
+       FROM task_applications
+       WHERE task_id=$1 AND status='ACCEPTED'`,
+      [taskId]
+    );
+    const acceptedWorkers = Number(acceptedResult.rows[0].accepted_workers);
+    const remainingPositions = getRemainingWorkerSlots(
+      task.worker_capacity,
+      acceptedWorkers
+    );
+
+    if (remainingPositions <= 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({
+        error: "All worker positions for this job have been filled"
       });
     }
 
-    const result = await pool.query(
+    const result = await client.query(
       `INSERT INTO task_applications
        (task_id, applicant_id, message)
        VALUES($1, $2, $3)
@@ -949,22 +978,35 @@ app.post("/api/tasks/:id/applications", auth, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
       return res.status(409).json({
         error: "You have already applied for this job"
       });
     }
 
-    res.status(201).json({
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return res.status(201).json({
       message: "Job application submitted successfully",
       application: result.rows[0]
     });
-
   } catch (e) {
-    console.error("Job application error:", e);
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Application submission rollback failed:", rollbackError);
+      }
+    }
 
-    res.status(500).json({
+    console.error("Job application error:", e);
+    return res.status(500).json({
       error: "Unable to submit job application"
     });
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -1003,6 +1045,279 @@ app.get("/api/my-applications", auth, async (req, res) => {
   }
 });
 
+async function loadPosterApplications(req, res, taskId = null) {
+  const result = await pool.query(
+    `SELECT
+       a.id AS application_id,
+       a.task_id,
+       a.message,
+       a.status AS application_status,
+       a.created_at AS applied_at,
+       t.title AS task_title,
+       t.status AS task_status,
+       t.reward,
+       t.currency,
+       t.worker_capacity,
+       (SELECT COUNT(*)::int
+        FROM task_applications accepted
+        WHERE accepted.task_id=t.id
+          AND accepted.status='ACCEPTED') AS accepted_workers,
+       GREATEST(
+         t.worker_capacity -
+         (SELECT COUNT(*)::int
+          FROM task_applications accepted
+          WHERE accepted.task_id=t.id
+            AND accepted.status='ACCEPTED'),
+         0
+       ) AS remaining_positions,
+       u.id AS applicant_id,
+       u.name AS applicant_name,
+       u.phone AS applicant_phone,
+       u.verified AS applicant_verified
+     FROM task_applications a
+     JOIN tasks t ON t.id=a.task_id
+     JOIN users u ON u.id=a.applicant_id
+     WHERE t.owner_id=$1
+       AND ($2::integer IS NULL OR t.id=$2)
+     ORDER BY a.created_at DESC`,
+    [req.user.id, taskId]
+  );
+
+  return res.json({ applications: result.rows });
+}
+
+app.get("/api/poster/applications", auth, async (req, res) => {
+  const taskId = req.query.task_id === undefined
+    ? null
+    : Number(req.query.task_id);
+
+  if (
+    taskId !== null &&
+    (!Number.isInteger(taskId) || taskId <= 0)
+  ) {
+    return res.status(400).json({ error: "Invalid task ID" });
+  }
+
+  try {
+    return await loadPosterApplications(req, res, taskId);
+  } catch (e) {
+    console.error("Poster applications error:", e);
+    return res.status(500).json({
+      error: "Unable to load received applications"
+    });
+  }
+});
+
+app.get("/api/tasks/:id/applications", auth, async (req, res) => {
+  const taskId = Number(req.params.id);
+
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    return res.status(400).json({ error: "Invalid task ID" });
+  }
+
+  try {
+    const taskResult = await pool.query(
+      "SELECT id, owner_id FROM tasks WHERE id=$1",
+      [taskId]
+    );
+    const task = taskResult.rows[0];
+
+    if (!task) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+
+    if (Number(task.owner_id) !== Number(req.user.id)) {
+      return res.status(403).json({
+        error: "You can only view applications for your own tasks"
+      });
+    }
+
+    return await loadPosterApplications(req, res, taskId);
+  } catch (e) {
+    console.error("Task applications error:", e);
+    return res.status(500).json({
+      error: "Unable to load task applications"
+    });
+  }
+});
+
+async function decideTaskApplication(req, res, decision) {
+  const applicationId = Number(req.params.id);
+
+  if (!Number.isInteger(applicationId) || applicationId <= 0) {
+    return res.status(400).json({ error: "Invalid application ID" });
+  }
+
+  let client;
+  let transactionStarted = false;
+
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const applicationLookup = await client.query(
+      "SELECT task_id FROM task_applications WHERE id=$1",
+      [applicationId]
+    );
+
+    if (!applicationLookup.rows.length) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    // Lock the task first so concurrent decisions cannot exceed capacity.
+    const taskResult = await client.query(
+      `SELECT id, owner_id, status, worker_capacity
+       FROM tasks
+       WHERE id=$1
+       FOR UPDATE`,
+      [applicationLookup.rows[0].task_id]
+    );
+    const task = taskResult.rows[0];
+
+    if (!task) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Task not found" });
+    }
+
+    if (Number(task.owner_id) !== Number(req.user.id)) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(403).json({
+        error: "Only the task poster can decide applications"
+      });
+    }
+
+    const applicationResult = await client.query(
+      `SELECT id, task_id, status
+       FROM task_applications
+       WHERE id=$1 AND task_id=$2
+       FOR UPDATE`,
+      [applicationId, task.id]
+    );
+    const application = applicationResult.rows[0];
+
+    if (!application) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({ error: "Application not found" });
+    }
+
+    if (application.status !== "PENDING") {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(409).json({
+        error: "This application has already been decided",
+        application_status: application.status
+      });
+    }
+
+    let acceptedWorkers = 0;
+
+    if (decision === "ACCEPTED") {
+      if (task.status !== "OPEN") {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+        return res.status(409).json({
+          error: "This task is no longer accepting workers"
+        });
+      }
+
+      const countResult = await client.query(
+        `SELECT COUNT(*)::int AS accepted_workers
+         FROM task_applications
+         WHERE task_id=$1 AND status='ACCEPTED'`,
+        [task.id]
+      );
+      acceptedWorkers = Number(countResult.rows[0].accepted_workers);
+
+      if (!getRemainingWorkerSlots(task.worker_capacity, acceptedWorkers)) {
+        await client.query(
+          "UPDATE tasks SET status='FILLED' WHERE id=$1",
+          [task.id]
+        );
+        await client.query("COMMIT");
+        transactionStarted = false;
+        return res.status(409).json({
+          error: "All worker positions for this task have been filled",
+          worker_capacity: Number(task.worker_capacity),
+          accepted_workers: acceptedWorkers,
+          remaining_positions: 0
+        });
+      }
+    }
+
+    const updatedApplication = await client.query(
+      `UPDATE task_applications
+       SET status=$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2
+       RETURNING id, task_id, applicant_id, message, status, created_at, updated_at`,
+      [decision, applicationId]
+    );
+
+    if (decision === "ACCEPTED") {
+      acceptedWorkers += 1;
+      const remainingPositions = getRemainingWorkerSlots(
+        task.worker_capacity,
+        acceptedWorkers
+      );
+
+      if (remainingPositions === 0) {
+        await client.query(
+          "UPDATE tasks SET status='FILLED' WHERE id=$1",
+          [task.id]
+        );
+      }
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      return res.json({
+        message: "Applicant accepted successfully",
+        application: updatedApplication.rows[0],
+        worker_capacity: Number(task.worker_capacity),
+        accepted_workers: acceptedWorkers,
+        remaining_positions: remainingPositions,
+        task_status: remainingPositions === 0 ? "FILLED" : "OPEN"
+      });
+    }
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return res.json({
+      message: "Applicant rejected successfully",
+      application: updatedApplication.rows[0]
+    });
+  } catch (e) {
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Application decision rollback failed:", rollbackError);
+      }
+    }
+
+    console.error("Application decision error:", e);
+    return res.status(500).json({
+      error: "Unable to update application"
+    });
+  } finally {
+    if (client) client.release();
+  }
+}
+
+app.post("/api/applications/:id/accept", auth, async (req, res) => {
+  return decideTaskApplication(req, res, "ACCEPTED");
+});
+
+app.post("/api/applications/:id/reject", auth, async (req, res) => {
+  return decideTaskApplication(req, res, "REJECTED");
+});
+
 app.post("/api/tasks", auth, async (req, res) => {
   const {
     title,
@@ -1013,6 +1328,8 @@ app.post("/api/tasks", auth, async (req, res) => {
     featured
   } = req.body;
 
+  const workerCapacityInput = req.body.worker_capacity ?? req.body.workerCapacity ?? 1;
+  const workerCapacity = parseWorkerCapacity(workerCapacityInput);
   const amount = Number(reward);
   const taskCurrency = String(currency).trim().toUpperCase();
     const supportedCurrencies = new Set([
@@ -1032,6 +1349,7 @@ app.post("/api/tasks", auth, async (req, res) => {
     !category ||
     !Number.isFinite(amount) ||
     amount <= 0 ||
+    workerCapacity === null ||
     !supportedCurrencies.has(taskCurrency)
   ) {
     return res.status(400).json({
@@ -1066,8 +1384,8 @@ app.post("/api/tasks", auth, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO tasks
        (owner_id, title, description, category,
-        reward, featured, country_code, currency)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        reward, featured, country_code, currency, worker_capacity)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
       [
         req.user.id,
@@ -1077,7 +1395,8 @@ app.post("/api/tasks", auth, async (req, res) => {
         amount,
         featured ? 1 : 0,
         countryCode,
-        taskCurrency
+        taskCurrency,
+        workerCapacity
       ]
     );
 
@@ -1117,6 +1436,13 @@ app.post("/api/tasks/:id/accept", auth, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(409).json({
         error: "Task unavailable"
+      });
+    }
+
+    if (Number(task.worker_capacity || 1) > 1) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "This task requires poster selection from submitted applications. Apply for the task and wait for the poster to review your application."
       });
     }
 
@@ -1845,4 +2171,8 @@ async function startServer() {
   }
 }
 
-startServer();
+if (process.env.NODE_ENV !== "test") {
+  startServer();
+}
+
+export { app, pool, initDatabase };
