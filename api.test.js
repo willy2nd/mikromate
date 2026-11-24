@@ -5,15 +5,19 @@ import { parseWorkerCapacity, getRemainingWorkerSlots } from "./worker-capacity.
 
 const source = readFileSync(new URL("./server.js", import.meta.url), "utf8");
 
-test("poster applications endpoint is authenticated and returns only the poster's tasks", () => {
-  const start = source.indexOf('app.get("/api/poster/applications", auth');
-  assert.notEqual(start, -1);
-  const end = source.indexOf('app.get("/api/tasks/:id/applications", auth', start);
-  assert.notEqual(end, -1);
-  const route = source.slice(start, end);
-  assert.match(route, /WHERE t\.owner_id=\$1/);
-  assert.match(route, /req\.user\.id/);
-  assert.match(route, /applications: result\.rows/);
+test("poster applications endpoint is authenticated and its query scopes results to the poster", () => {
+  const helperStart = source.indexOf("async function loadPosterApplications");
+  const routeStart = source.indexOf('app.get("/api/poster/applications", auth');
+  const routeEnd = source.indexOf('app.get("/api/tasks/:id/applications", auth', routeStart);
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(routeStart, -1);
+  assert.notEqual(routeEnd, -1);
+  const helper = source.slice(helperStart, routeStart);
+  const route = source.slice(routeStart, routeEnd);
+  assert.match(helper, /WHERE t\.owner_id=\$1/);
+  assert.match(helper, /req\.user\.id/);
+  assert.match(helper, /applications: result\.rows/);
+  assert.match(route, /auth/);
 });
 
 test("application submission serializes capacity checks with decisions", () => {
