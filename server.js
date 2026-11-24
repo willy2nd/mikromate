@@ -223,6 +223,10 @@ ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES';
 
 ALTER TABLE transactions
 ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'KES';
+ALTER TABLE transactions
+ADD COLUMN IF NOT EXISTS payment_purpose TEXT NOT NULL DEFAULT 'TASK_PAYMENT'
+CHECK (payment_purpose IN ('TASK_PAYMENT', 'WALLET_DEPOSIT'));
+
 -- M-PESA payment verification fields
 ALTER TABLE transactions
 ADD COLUMN IF NOT EXISTS provider_receipt TEXT;
@@ -1400,6 +1404,80 @@ app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
  * M-Pesa Daraja STK Push
  */
 
+app.post("/api/wallet/deposits/mpesa", auth, async (req, res) => {
+  let transactionId = null;
+  try {
+    const currency = String(req.body?.currency || "KES").trim().toUpperCase();
+    const amount = Number(req.body?.amount);
+    if (currency !== "KES") {
+      return res.status(400).json({ error: "M-PESA wallet deposits are only available in KES" });
+    }
+    if (!Number.isSafeInteger(amount) || amount < 1) {
+      return res.status(400).json({ error: "Enter a whole-number KES deposit of at least KSh 1" });
+    }
+
+    const phone = normalizeKenyanPhone(req.body?.phone);
+    const created = await pool.query(
+      `INSERT INTO transactions
+       (task_id, payer_id, gross_amount, platform_fee, provider_amount,
+        status, currency, payment_phone, payment_purpose)
+       VALUES (0, $1, $2, 0, 0, 'PAYMENT_PENDING', 'KES', $3, 'WALLET_DEPOSIT')
+       RETURNING id`,
+      [req.user.id, amount, phone]
+    );
+    transactionId = created.rows[0].id;
+
+    const stk = await stkPush({
+      phone,
+      amount,
+      accountReference: `MMW${transactionId}`,
+      transactionDesc: "MikroMate wallet"
+    });
+
+    const checkoutRequestId = String(stk.CheckoutRequestID || "").trim();
+    if (String(stk.ResponseCode) !== "0" || !checkoutRequestId) {
+      await pool.query(
+        `UPDATE transactions SET status='PAYMENT_FAILED'
+         WHERE id=$1 AND status='PAYMENT_PENDING'`,
+        [transactionId]
+      );
+      return res.status(502).json({
+        error: stk.ResponseDescription || "Safaricom did not accept the M-PESA request"
+      });
+    }
+
+    await pool.query(
+      `UPDATE transactions SET external_reference=$1
+       WHERE id=$2 AND status='PAYMENT_PENDING'`,
+      [checkoutRequestId, transactionId]
+    );
+
+    return res.status(202).json({
+      ok: true,
+      transaction_id: transactionId,
+      status: "PENDING",
+      checkout_request_id: checkoutRequestId,
+      customer_message: stk.CustomerMessage ||
+        "Check your phone and enter your M-PESA PIN to complete the deposit."
+    });
+  } catch (e) {
+    if (transactionId !== null) {
+      await pool.query(
+        `UPDATE transactions SET status='PAYMENT_FAILED'
+         WHERE id=$1 AND status='PAYMENT_PENDING'`,
+        [transactionId]
+      ).catch(updateError =>
+        console.error("Wallet deposit failure update error:", updateError.message)
+      );
+    }
+    console.error("M-PESA wallet deposit initiation error:", e);
+    return res.status(400).json({
+      error: e.message || "Unable to initiate M-PESA wallet deposit"
+    });
+  }
+});
+
+
 app.post("/api/payments/mpesa/initiate", auth, async (req, res) => {
   try {
     const { phone, amount, taskId, currency = "KES" } = req.body;
@@ -1509,7 +1587,7 @@ app.post("/api/payments/mpesa/callback", async (req, res) => {
     await client.query("BEGIN");
 
     const transactionResult = await client.query(
-      `SELECT id, payer_id, gross_amount, currency, payment_phone, status
+      `SELECT id, payer_id, gross_amount, currency, payment_phone, payment_purpose, status
        FROM transactions
        WHERE external_reference=$1
        FOR UPDATE`,
@@ -1610,7 +1688,22 @@ app.post("/api/payments/mpesa/callback", async (req, res) => {
       });
     }
 
-    // Save the provider receipt and wallet credit atomically.
+    // Task payments settle the task transaction; they must never credit a user's wallet.
+    if (payment.payment_purpose !== "WALLET_DEPOSIT") {
+      await client.query(
+        `UPDATE transactions
+         SET status='PAID', provider_receipt=$1
+         WHERE id=$2 AND status='PAYMENT_PENDING'`,
+        [receipt, payment.id]
+      );
+      await client.query("COMMIT");
+      return res.json({
+        ResultCode: 0,
+        ResultDesc: "Task payment processed successfully"
+      });
+    }
+
+    // Wallet deposits are credited atomically with their receipt and payment status.
     await client.query(
       `INSERT INTO wallets (user_id, currency, balance)
        VALUES ($1, 'KES', 0)
