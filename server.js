@@ -9,7 +9,7 @@ import pg from "pg";
 import { randomBytes, createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getAccessToken, stkPush, normalizeKenyanPhone } from "./mpesa.js";
+import { getAccessToken, stkPush, b2cPayment, normalizeKenyanPhone } from "./mpesa.js";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -209,6 +209,29 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_wallet_transactions_wallet_id
     ON wallet_transactions(wallet_id);
+
+    -- Withdrawal requests reserve funds until Daraja confirms the payout.
+    CREATE TABLE IF NOT EXISTS wallet_withdrawals(
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      wallet_id INTEGER NOT NULL REFERENCES wallets(id),
+      wallet_transaction_id INTEGER REFERENCES wallet_transactions(id),
+      amount NUMERIC(14,2) NOT NULL CHECK(amount > 0),
+      currency VARCHAR(3) NOT NULL DEFAULT 'KES' CHECK(currency='KES'),
+      phone TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'REQUESTED'
+        CHECK(status IN ('REQUESTED','PROCESSING','COMPLETED','FAILED','RECONCILIATION_REQUIRED')),
+      originator_conversation_id TEXT NOT NULL UNIQUE,
+      conversation_id TEXT UNIQUE,
+      provider_receipt TEXT UNIQUE,
+      failure_reason TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_wallet_withdrawals_user_created
+    ON wallet_withdrawals(user_id, created_at DESC);
 
     -- International country support
 ALTER TABLE users
@@ -1441,6 +1464,382 @@ app.get("/api/wallet", auth, async (req, res) => {
     console.error("Wallet load error:", e);
     return res.status(500).json({ error: "Unable to load wallet" });
   }
+});
+
+
+async function reverseReservedWithdrawal(withdrawalId, reason) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const found = await client.query(
+      "SELECT * FROM wallet_withdrawals WHERE id=$1 FOR UPDATE",
+      [withdrawalId]
+    );
+    if (found.rowCount !== 1 || ["FAILED","COMPLETED"].includes(found.rows[0].status)) {
+      await client.query("COMMIT");
+      return;
+    }
+    const withdrawal = found.rows[0];
+    await client.query("SELECT id FROM wallets WHERE id=$1 FOR UPDATE", [withdrawal.wallet_id]);
+    await client.query(
+      `UPDATE wallet_transactions
+       SET status='FAILED', completed_at=CURRENT_TIMESTAMP
+       WHERE id=$1 AND status='PENDING'`,
+      [withdrawal.wallet_transaction_id]
+    );
+    const refund = await client.query(
+      `INSERT INTO wallet_transactions
+       (wallet_id, transaction_type, amount, status, provider,
+        provider_reference, description, completed_at)
+       VALUES ($1,'REFUND',$2,'COMPLETED','MPESA_B2C',$3,$4,CURRENT_TIMESTAMP)
+       ON CONFLICT (provider, provider_reference) DO NOTHING
+       RETURNING id`,
+      [withdrawal.wallet_id, withdrawal.amount,
+       `WITHDRAWAL-REFUND:${withdrawal.id}`,
+       `Refund for rejected M-PESA withdrawal ${withdrawal.id}`]
+    );
+    if (refund.rowCount === 1) {
+      await client.query(
+        "UPDATE wallets SET balance=balance+$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2",
+        [withdrawal.amount, withdrawal.wallet_id]
+      );
+    }
+    await client.query(
+      `UPDATE wallet_withdrawals
+       SET status='FAILED', failure_reason=$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [String(reason).slice(0,500), withdrawal.id]
+    );
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+app.post("/api/wallet/withdrawals", auth, async (req, res) => {
+  const currency = String(req.body?.currency || "KES").trim().toUpperCase();
+  const amount = Number(req.body?.amount);
+  let phone;
+  try {
+    phone = normalizeKenyanPhone(req.body?.phone);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  if (currency !== "KES") {
+    return res.status(400).json({ error: "M-PESA withdrawals are only available in KES" });
+  }
+  if (!Number.isSafeInteger(amount) || amount < 1) {
+    return res.status(400).json({ error: "Enter a whole-number KES withdrawal amount of at least KSh 1" });
+  }
+
+  // Never reserve funds unless the dedicated B2C payout configuration is present.
+  const requiredB2C = [
+    "MPESA_B2C_INITIATOR_NAME",
+    "MPESA_B2C_SECURITY_CREDENTIAL",
+    "MPESA_B2C_SHORTCODE",
+    "MPESA_B2C_RESULT_URL",
+    "MPESA_B2C_TIMEOUT_URL"
+  ];
+  const missingB2C = requiredB2C.filter(name => !process.env[name]);
+  if (missingB2C.length) {
+    return res.status(503).json({
+      error: "M-PESA withdrawals are not enabled yet. B2C payout configuration is incomplete."
+    });
+  }
+
+  const client = await pool.connect();
+  let withdrawalId;
+  let originatorConversationId;
+  try {
+    await client.query("BEGIN");
+
+    const walletResult = await client.query(
+      `SELECT id, balance
+       FROM wallets
+       WHERE user_id=$1 AND currency='KES'
+       FOR UPDATE`,
+      [req.user.id]
+    );
+
+    if (walletResult.rowCount !== 1) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "KES wallet not found" });
+    }
+
+    const wallet = walletResult.rows[0];
+    if (Number(wallet.balance) < amount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Insufficient available wallet balance" });
+    }
+
+    const inserted = await client.query(
+      `INSERT INTO wallet_withdrawals
+       (user_id, wallet_id, amount, phone, originator_conversation_id)
+       VALUES ($1,$2,$3,$4,'PENDING')
+       RETURNING id`,
+      [req.user.id, wallet.id, amount, phone]
+    );
+    withdrawalId = inserted.rows[0].id;
+    originatorConversationId = `MMWOUT${withdrawalId}`;
+
+    await client.query(
+      `UPDATE wallet_withdrawals
+       SET originator_conversation_id=$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [originatorConversationId, withdrawalId]
+    );
+
+    const ledger = await client.query(
+      `INSERT INTO wallet_transactions
+       (wallet_id, transaction_type, amount, status, provider,
+        provider_reference, description)
+       VALUES ($1,'WITHDRAWAL',$2,'PENDING','MPESA_B2C',$3,$4)
+       RETURNING id`,
+      [wallet.id, amount, originatorConversationId,
+       `M-PESA withdrawal request ${withdrawalId}`]
+    );
+
+    await client.query(
+      `UPDATE wallet_withdrawals
+       SET wallet_transaction_id=$1
+       WHERE id=$2`,
+      [ledger.rows[0].id, withdrawalId]
+    );
+
+    const debit = await client.query(
+      `UPDATE wallets
+       SET balance=balance-$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2 AND balance >= $1
+       RETURNING balance`,
+      [amount, wallet.id]
+    );
+    if (debit.rowCount !== 1) {
+      throw new Error("Wallet balance changed before withdrawal reservation");
+    }
+
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Wallet withdrawal reservation failed:", e);
+    return res.status(500).json({ error: "Unable to reserve wallet funds for withdrawal" });
+  } finally {
+    client.release();
+  }
+
+  try {
+    const payout = await b2cPayment({
+      phone,
+      amount,
+      originatorConversationId,
+      remarks: `MikroMate withdrawal ${withdrawalId}`
+    });
+
+    const conversationId = String(payout.ConversationID || "").trim();
+    if (String(payout.ResponseCode) !== "0" || !conversationId) {
+      await reverseReservedWithdrawal(withdrawalId, "Daraja rejected the B2C request");
+      return res.status(502).json({
+        error: payout.ResponseDescription || "Safaricom did not accept the payout request"
+      });
+    }
+
+    await pool.query(
+      `UPDATE wallet_withdrawals
+       SET status='PROCESSING', conversation_id=$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2 AND status='REQUESTED'`,
+      [conversationId, withdrawalId]
+    );
+
+    return res.status(202).json({
+      ok: true,
+      withdrawal_id: withdrawalId,
+      status: "PROCESSING",
+      message: "Withdrawal request accepted for processing. Wallet funds remain reserved until Safaricom confirms the payout."
+    });
+  } catch (e) {
+    // A network failure can happen after Safaricom accepted the request.
+    // Keep the funds reserved until a result callback or manual reconciliation.
+    await pool.query(
+      `UPDATE wallet_withdrawals
+       SET status='RECONCILIATION_REQUIRED',
+           failure_reason='B2C response was not conclusive; payout must be reconciled',
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$1 AND status='REQUESTED'`,
+      [withdrawalId]
+    );
+    console.error("B2C payout response uncertain:", {
+      withdrawalId,
+      message: e.message
+    });
+    return res.status(202).json({
+      ok: true,
+      withdrawal_id: withdrawalId,
+      status: "RECONCILIATION_REQUIRED",
+      message: "Payout status is being reconciled. Funds remain reserved; do not submit another withdrawal."
+    });
+  }
+});
+
+app.get("/api/wallet/withdrawals", auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, amount, currency, phone, status, provider_receipt,
+              failure_reason, created_at, updated_at, completed_at
+       FROM wallet_withdrawals
+       WHERE user_id=$1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [req.user.id]
+    );
+    return res.json({ withdrawals: result.rows });
+  } catch (e) {
+    console.error("Wallet withdrawals load error:", e);
+    return res.status(500).json({ error: "Unable to load withdrawals" });
+  }
+});
+
+app.post("/api/wallet/withdrawals/result", async (req, res) => {
+  const result = req.body?.Result;
+  const originatorId = String(result?.OriginatorConversationID || "").trim();
+  const resultCode = Number(result?.ResultCode);
+  if (!originatorId || !Number.isInteger(resultCode)) {
+    return res.status(400).json({ ResultCode: 1, ResultDesc: "Invalid B2C result payload" });
+  }
+
+  const parameters = result?.ResultParameters?.ResultParameter;
+  const metadata = Array.isArray(parameters)
+    ? Object.fromEntries(parameters.filter(p => p && typeof p.Key === "string").map(p => [p.Key, p.Value]))
+    : {};
+  const receipt = String(metadata.TransactionReceipt || "").trim();
+  const paidAmount = Number(metadata.TransactionAmount);
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const found = await client.query(
+      `SELECT * FROM wallet_withdrawals
+       WHERE originator_conversation_id=$1
+       FOR UPDATE`,
+      [originatorId]
+    );
+    if (found.rowCount !== 1) {
+      await client.query("ROLLBACK");
+      console.warn("Unmatched B2C result callback:", originatorId);
+      return res.json({ ResultCode: 0, ResultDesc: "Accepted for reconciliation" });
+    }
+
+    const withdrawal = found.rows[0];
+    if (["COMPLETED","FAILED"].includes(withdrawal.status)) {
+      await client.query("COMMIT");
+      return res.json({ ResultCode: 0, ResultDesc: "Already processed" });
+    }
+
+    const wallet = await client.query(
+      "SELECT id FROM wallets WHERE id=$1 FOR UPDATE",
+      [withdrawal.wallet_id]
+    );
+    if (wallet.rowCount !== 1) throw new Error("Withdrawal wallet not found");
+
+    if (resultCode === 0) {
+      if (!receipt || !Number.isFinite(paidAmount) || paidAmount !== Number(withdrawal.amount)) {
+        await client.query(
+          `UPDATE wallet_withdrawals
+           SET status='RECONCILIATION_REQUIRED',
+               failure_reason='Successful callback missing matching receipt or amount',
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$1`,
+          [withdrawal.id]
+        );
+        await client.query("COMMIT");
+        return res.json({ ResultCode: 0, ResultDesc: "Queued for payout reconciliation" });
+      }
+
+      await client.query(
+        `UPDATE wallet_transactions
+         SET status='COMPLETED', provider_reference=$1,
+             completed_at=CURRENT_TIMESTAMP
+         WHERE id=$2 AND transaction_type='WITHDRAWAL' AND status='PENDING'`,
+        [receipt, withdrawal.wallet_transaction_id]
+      );
+      await client.query(
+        `UPDATE wallet_withdrawals
+         SET status='COMPLETED', provider_receipt=$1,
+             failure_reason=NULL, completed_at=CURRENT_TIMESTAMP,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [receipt, withdrawal.id]
+      );
+      await client.query("COMMIT");
+      console.log("M-PESA withdrawal completed:", {
+        withdrawalId: withdrawal.id,
+        receipt,
+        amount: Number(withdrawal.amount)
+      });
+      return res.json({ ResultCode: 0, ResultDesc: "Withdrawal completed" });
+    }
+
+    await client.query(
+      `UPDATE wallet_transactions
+       SET status='FAILED', completed_at=CURRENT_TIMESTAMP
+       WHERE id=$1 AND transaction_type='WITHDRAWAL' AND status='PENDING'`,
+      [withdrawal.wallet_transaction_id]
+    );
+    const refund = await client.query(
+      `INSERT INTO wallet_transactions
+       (wallet_id, transaction_type, amount, status, provider,
+        provider_reference, description, completed_at)
+       VALUES ($1,'REFUND',$2,'COMPLETED','MPESA_B2C',$3,$4,CURRENT_TIMESTAMP)
+       ON CONFLICT (provider, provider_reference) DO NOTHING
+       RETURNING id`,
+      [withdrawal.wallet_id, withdrawal.amount,
+       `WITHDRAWAL-REFUND:${withdrawal.id}`,
+       `Refund for failed M-PESA withdrawal ${withdrawal.id}`]
+    );
+    if (refund.rowCount === 1) {
+      await client.query(
+        `UPDATE wallets
+         SET balance=balance+$1, updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [withdrawal.amount, withdrawal.wallet_id]
+      );
+    }
+    await client.query(
+      `UPDATE wallet_withdrawals
+       SET status='FAILED', failure_reason=$1,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [String(result?.ResultDesc || "Safaricom reported payout failure").slice(0,500), withdrawal.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ ResultCode: 0, ResultDesc: "Payout failure recorded and funds restored" });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("B2C result callback processing failed:", e);
+    return res.status(500).json({ ResultCode: 1, ResultDesc: "Callback processing failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/wallet/withdrawals/timeout", async (req, res) => {
+  const result = req.body?.Result;
+  const originatorId = String(result?.OriginatorConversationID || "").trim();
+  if (!originatorId) {
+    return res.status(400).json({ ResultCode: 1, ResultDesc: "Invalid B2C timeout payload" });
+  }
+  await pool.query(
+    `UPDATE wallet_withdrawals
+     SET status='RECONCILIATION_REQUIRED',
+         failure_reason='Daraja payout timed out; final status must be checked before releasing reserved funds',
+         updated_at=CURRENT_TIMESTAMP
+     WHERE originator_conversation_id=$1
+       AND status IN ('REQUESTED','PROCESSING')`,
+    [originatorId]
+  );
+  return res.json({ ResultCode: 0, ResultDesc: "Timeout received; payout queued for reconciliation" });
 });
 
 
