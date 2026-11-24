@@ -1404,6 +1404,46 @@ app.get("/api/admin/dashboard", auth, admin, async (req, res) => {
  * M-Pesa Daraja STK Push
  */
 
+app.get("/api/wallet", auth, async (req, res) => {
+  try {
+    const [walletResult, transactionResult] = await Promise.all([
+      pool.query(
+        `SELECT id, currency, balance
+         FROM wallets
+         WHERE user_id=$1
+         ORDER BY currency ASC`,
+        [req.user.id]
+      ),
+      pool.query(
+        `SELECT
+           wt.id,
+           wt.transaction_type,
+           wt.amount,
+           wt.status,
+           w.currency,
+           wt.description,
+           wt.provider_reference AS provider_receipt,
+           wt.created_at
+         FROM wallet_transactions wt
+         JOIN wallets w ON w.id=wt.wallet_id
+         WHERE w.user_id=$1
+         ORDER BY wt.created_at DESC, wt.id DESC
+         LIMIT 50`,
+        [req.user.id]
+      )
+    ]);
+
+    return res.json({
+      wallets: walletResult.rows,
+      transactions: transactionResult.rows
+    });
+  } catch (e) {
+    console.error("Wallet load error:", e);
+    return res.status(500).json({ error: "Unable to load wallet" });
+  }
+});
+
+
 app.post("/api/wallet/deposits/mpesa", auth, async (req, res) => {
   let transactionId = null;
   try {
