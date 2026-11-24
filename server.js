@@ -1753,8 +1753,8 @@ app.post("/api/wallet/withdrawals/result", async (req, res) => {
     );
     if (found.rowCount !== 1) {
       await client.query("ROLLBACK");
-      console.warn("Unmatched B2C result callback:", originatorId);
-      return res.json({ ResultCode: 0, ResultDesc: "Accepted for reconciliation" });
+      console.warn("Unmatched B2C result callback; requesting provider retry:", originatorId);
+      return res.status(503).json({ ResultCode: 1, ResultDesc: "Withdrawal correlation is not ready; retry callback" });
     }
 
     const withdrawal = found.rows[0];
@@ -1783,13 +1783,16 @@ app.post("/api/wallet/withdrawals/result", async (req, res) => {
         return res.json({ ResultCode: 0, ResultDesc: "Queued for payout reconciliation" });
       }
 
-      await client.query(
+      const completedLedger = await client.query(
         `UPDATE wallet_transactions
          SET status='COMPLETED', provider_reference=$1,
              completed_at=CURRENT_TIMESTAMP
          WHERE id=$2 AND transaction_type='WITHDRAWAL' AND status='PENDING'`,
         [receipt, withdrawal.wallet_transaction_id]
       );
+      if (completedLedger.rowCount !== 1) {
+        throw new Error("Pending withdrawal ledger entry could not be completed");
+      }
       await client.query(
         `UPDATE wallet_withdrawals
          SET status='COMPLETED', provider_receipt=$1,
@@ -1807,12 +1810,15 @@ app.post("/api/wallet/withdrawals/result", async (req, res) => {
       return res.json({ ResultCode: 0, ResultDesc: "Withdrawal completed" });
     }
 
-    await client.query(
+    const failedLedger = await client.query(
       `UPDATE wallet_transactions
        SET status='FAILED', completed_at=CURRENT_TIMESTAMP
        WHERE id=$1 AND transaction_type='WITHDRAWAL' AND status='PENDING'`,
       [withdrawal.wallet_transaction_id]
     );
+    if (failedLedger.rowCount !== 1) {
+      throw new Error("Pending withdrawal ledger entry could not be marked failed");
+    }
     const refund = await client.query(
       `INSERT INTO wallet_transactions
        (wallet_id, transaction_type, amount, status, provider,
@@ -1860,7 +1866,7 @@ app.post("/api/wallet/withdrawals/timeout", async (req, res) => {
   if (!originatorId) {
     return res.status(400).json({ ResultCode: 1, ResultDesc: "Invalid B2C timeout payload" });
   }
-  await pool.query(
+  const updated = await pool.query(
     `UPDATE wallet_withdrawals
      SET status='RECONCILIATION_REQUIRED',
          failure_reason='Daraja payout timed out; final status must be checked before releasing reserved funds',
@@ -1869,6 +1875,9 @@ app.post("/api/wallet/withdrawals/timeout", async (req, res) => {
        AND status IN ('REQUESTED','PROCESSING')`,
     [originatorId]
   );
+  if (updated.rowCount !== 1) {
+    return res.status(503).json({ ResultCode: 1, ResultDesc: "Withdrawal correlation is not ready; retry timeout callback" });
+  }
   return res.json({ ResultCode: 0, ResultDesc: "Timeout received; payout queued for reconciliation" });
 });
 
