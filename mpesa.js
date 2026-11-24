@@ -63,11 +63,19 @@ export async function b2cPayment({
   const initiator = process.env.MPESA_B2C_INITIATOR_NAME;
   const credential = process.env.MPESA_B2C_SECURITY_CREDENTIAL;
   const shortcode = process.env.MPESA_B2C_SHORTCODE;
-  const resultUrl = process.env.MPESA_B2C_RESULT_URL;
-  const timeoutUrl = process.env.MPESA_B2C_TIMEOUT_URL;
-  if (!initiator || !credential || !shortcode || !resultUrl || !timeoutUrl) {
+  const configuredResultUrl = process.env.MPESA_B2C_RESULT_URL;
+  const configuredTimeoutUrl = process.env.MPESA_B2C_TIMEOUT_URL;
+  const callbackToken = process.env.MPESA_B2C_CALLBACK_TOKEN;
+  if (!initiator || !credential || !shortcode ||
+      !configuredResultUrl || !configuredTimeoutUrl || !callbackToken) {
     throw new Error("Dedicated M-PESA B2C payout configuration is incomplete");
   }
+
+  // Daraja callbacks carry a per-service secret query token; never expose it in logs.
+  const resultUrl = new URL(configuredResultUrl);
+  resultUrl.searchParams.set("token", callbackToken);
+  const timeoutUrl = new URL(configuredTimeoutUrl);
+  timeoutUrl.searchParams.set("token", callbackToken);
 
   const token = await getAccessToken();
   const response = await fetch(`${BASE}/mpesa/b2c/v1/paymentrequest`, {
