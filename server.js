@@ -216,6 +216,7 @@ async function initDatabase() {
       user_id INTEGER NOT NULL REFERENCES users(id),
       wallet_id INTEGER NOT NULL REFERENCES wallets(id),
       wallet_transaction_id INTEGER REFERENCES wallet_transactions(id),
+      idempotency_key TEXT NOT NULL,
       amount NUMERIC(14,2) NOT NULL CHECK(amount > 0),
       currency VARCHAR(3) NOT NULL DEFAULT 'KES' CHECK(currency='KES'),
       phone TEXT NOT NULL,
@@ -227,7 +228,8 @@ async function initDatabase() {
       failure_reason TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      completed_at TIMESTAMP
+      completed_at TIMESTAMP,
+      UNIQUE(user_id, idempotency_key)
     );
 
     CREATE INDEX IF NOT EXISTS idx_wallet_withdrawals_user_created
@@ -1520,6 +1522,10 @@ async function reverseReservedWithdrawal(withdrawalId, reason) {
 }
 
 app.post("/api/wallet/withdrawals", auth, async (req, res) => {
+  const idempotencyKey = String(req.get("Idempotency-Key") || "").trim();
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+    return res.status(400).json({ error: "A valid Idempotency-Key header (8-128 characters) is required" });
+  }
   const currency = String(req.body?.currency || "KES").trim().toUpperCase();
   const amount = Number(req.body?.amount);
   let phone;
@@ -1572,6 +1578,23 @@ app.post("/api/wallet/withdrawals", auth, async (req, res) => {
     }
 
     const wallet = walletResult.rows[0];
+    const priorRequest = await client.query(
+      `SELECT id, amount, status
+       FROM wallet_withdrawals
+       WHERE user_id=$1 AND idempotency_key=$2
+       FOR UPDATE`,
+      [req.user.id, idempotencyKey]
+    );
+    if (priorRequest.rowCount === 1) {
+      await client.query("ROLLBACK");
+      return res.status(200).json({
+        ok: true,
+        withdrawal_id: priorRequest.rows[0].id,
+        amount: Number(priorRequest.rows[0].amount),
+        status: priorRequest.rows[0].status,
+        message: "This withdrawal request was already received; no second payout was created."
+      });
+    }
     if (Number(wallet.balance) < amount) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Insufficient available wallet balance" });
@@ -1580,10 +1603,10 @@ app.post("/api/wallet/withdrawals", auth, async (req, res) => {
     originatorConversationId = `MMWOUT${randomBytes(12).toString("hex").toUpperCase()}`;
     const inserted = await client.query(
       `INSERT INTO wallet_withdrawals
-       (user_id, wallet_id, amount, phone, originator_conversation_id)
-       VALUES ($1,$2,$3,$4,$5)
+       (user_id, wallet_id, amount, phone, originator_conversation_id, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING id`,
-      [req.user.id, wallet.id, amount, phone, originatorConversationId]
+      [req.user.id, wallet.id, amount, phone, originatorConversationId, idempotencyKey]
     );
     withdrawalId = inserted.rows[0].id;
 
