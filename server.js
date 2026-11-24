@@ -1656,18 +1656,23 @@ app.post("/api/wallet/withdrawals", auth, async (req, res) => {
     });
 
     const conversationId = String(payout.ConversationID || "").trim();
-    if (String(payout.ResponseCode) !== "0" || !conversationId) {
-      await reverseReservedWithdrawal(withdrawalId, "Daraja rejected the B2C request");
-      return res.status(502).json({
-        error: payout.ResponseDescription || "Safaricom did not accept the payout request"
-      });
+    const darajaOriginatorId = String(payout.OriginatorConversationID || "").trim();
+    if (String(payout.ResponseCode) !== "0" || !conversationId || !darajaOriginatorId) {
+      if (String(payout.ResponseCode) !== "0") {
+        await reverseReservedWithdrawal(withdrawalId, "Daraja rejected the B2C request");
+        return res.status(502).json({
+          error: payout.ResponseDescription || "Safaricom did not accept the payout request"
+        });
+      }
+      throw new Error("Daraja accepted the request but returned incomplete correlation identifiers");
     }
 
     await pool.query(
       `UPDATE wallet_withdrawals
-       SET status='PROCESSING', conversation_id=$1, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2 AND status='REQUESTED'`,
-      [conversationId, withdrawalId]
+       SET status='PROCESSING', conversation_id=$1,
+           originator_conversation_id=$2, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$3 AND status='REQUESTED'`,
+      [conversationId, darajaOriginatorId, withdrawalId]
     );
 
     return res.status(202).json({
